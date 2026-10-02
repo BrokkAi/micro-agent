@@ -59,6 +59,13 @@ type turn struct {
 	mcp     map[string]mcpBinding
 }
 
+// mode reads the session mode, which can change while a turn runs.
+func (t *turn) mode() string {
+	t.s.mu.Lock()
+	defer t.s.mu.Unlock()
+	return t.s.Mode
+}
+
 type mcpBinding struct {
 	client *mcp.Client
 	tool   mcp.Tool
@@ -117,8 +124,9 @@ func function(name, description, parameters string) openrouter.Tool {
 // MCP name table.
 func (t *turn) tools(ctx context.Context) []openrouter.Tool {
 	tools := []openrouter.Tool{shellTool(resolveShell(t.a.cfg.Get().Shell))}
+	mode := t.mode()
 	for _, tool := range builtinTools {
-		if t.s.Mode == "plan" && (tool.Function.Name == "edit_file" || tool.Function.Name == "write_file") {
+		if mode == "plan" && (tool.Function.Name == "edit_file" || tool.Function.Name == "write_file") {
 			continue
 		}
 		tools = append(tools, tool)
@@ -242,7 +250,7 @@ func (t *turn) prepare(ctx context.Context, name string, raw json.RawMessage) (*
 			run:       func(ctx context.Context) toolResult { return t.read(ctx, path, args) },
 		}, nil
 	case "edit_file":
-		if t.s.Mode == "plan" {
+		if t.mode() == "plan" {
 			r := failure("file edits are disabled in plan mode")
 			return nil, &r
 		}
@@ -263,7 +271,7 @@ func (t *turn) prepare(ctx context.Context, name string, raw json.RawMessage) (*
 		}
 		return t.writeAction("Edit "+t.display(path), path, &old, updated), nil
 	case "write_file":
-		if t.s.Mode == "plan" {
+		if t.mode() == "plan" {
 			r := failure("file writes are disabled in plan mode")
 			return nil, &r
 		}
@@ -499,6 +507,7 @@ func (t *turn) shellLocal(ctx context.Context, sh shell, command string, timeout
 	run, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 	cmd := exec.CommandContext(run, sh.path, sh.args(command)...)
+	prepareCommand(cmd, sh, command)
 	cmd.Dir = t.s.Cwd
 	cmd.WaitDelay = 2 * time.Second
 	cmd.Stdout = spool

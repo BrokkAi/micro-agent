@@ -303,3 +303,43 @@ func TestLimitOutput(t *testing.T) {
 		t.Fatalf("short = %q", short)
 	}
 }
+
+func TestDeletedSessionIsNotResaved(t *testing.T) {
+	store, err := config.Load(filepath.Join(t.TempDir(), "config.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	a := New(store, "test")
+	s := &session{record: record{ID: newSessionID(), Cwd: t.TempDir()}}
+	a.sessions[s.ID] = s
+	if err := a.save(s); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := a.DeleteSession(context.Background(), nil, schema.DeleteSessionRequest{SessionID: s.ID}); err != nil {
+		t.Fatal(err)
+	}
+	if err := a.save(s); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := a.loadRecord(s.ID); err == nil {
+		t.Fatal("deleted session was written back")
+	}
+}
+
+func TestConfigKeepsSessionModel(t *testing.T) {
+	h := newHarness(t, schema.ClientCapabilities{})
+	session, err := h.conn.NewSession(context.Background(), h.dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	h.prompt(session, "/model other/model")
+	if err := h.store.Update(func(c *config.Config) error { c.Model = "global/model"; return nil }); err != nil {
+		t.Fatal(err)
+	}
+	h.prompt(session, "/config max_turns=9")
+	h.router.responses = [][]string{textChunks("hi")}
+	h.prompt(session, "hello")
+	if model := h.router.requests[0]["model"]; model != "other/model" {
+		t.Fatalf("model = %v", model)
+	}
+}

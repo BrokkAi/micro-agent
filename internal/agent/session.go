@@ -45,6 +45,8 @@ type session struct {
 	servers []*mcp.Client
 	// decisions remembers allow_always/reject_always answers by permission key.
 	decisions map[string]bool
+	// deleted stops a still-running turn from re-saving a deleted session.
+	deleted bool
 }
 
 func newSessionID() schema.SessionId {
@@ -63,11 +65,16 @@ func (a *Agent) sessionPath(id schema.SessionId) (string, error) {
 	return filepath.Join(a.sessionDir(), name+".json"), nil
 }
 
+// save writes the session record. It holds s.mu throughout so saves are
+// serialized and cannot race with deletion.
 func (a *Agent) save(s *session) error {
 	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.deleted {
+		return nil
+	}
 	s.UpdatedAt = time.Now().UTC()
 	data, err := json.Marshal(s.record)
-	s.mu.Unlock()
 	if err != nil {
 		return err
 	}
@@ -214,6 +221,9 @@ func (a *Agent) DeleteSession(_ context.Context, _ acpagent.Client, request sche
 	a.mu.Unlock()
 	if s != nil {
 		a.shutdown(s)
+		s.mu.Lock()
+		s.deleted = true
+		defer s.mu.Unlock()
 	}
 	path, err := a.sessionPath(request.SessionID)
 	if err != nil {

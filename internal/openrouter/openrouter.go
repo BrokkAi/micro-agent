@@ -208,12 +208,30 @@ func (c *Client) post(ctx context.Context, body []byte) (*http.Response, error) 
 	return response, nil
 }
 
-func assemble(body io.Reader, handler Handler) (Result, error) {
-	var result Result
+// assemble reads the stream into a Result. The message is filled in even when
+// an error or cancellation cuts the stream short, so callers can keep the
+// partial answer the user already saw.
+func assemble(body io.Reader, handler Handler) (result Result, err error) {
 	result.Message.Role = "assistant"
 	var text, reasoning strings.Builder
 	var calls []ToolCall
 	details := &detailMerger{}
+	defer func() {
+		if text.Len() > 0 {
+			result.Message.Content = text.String()
+		}
+		result.Message.Reasoning = reasoning.String()
+		result.Message.ReasoningDetails = details.result()
+		for i := range calls {
+			if calls[i].ID == "" {
+				calls[i].ID = fmt.Sprintf("call_%d_%d", time.Now().UnixNano(), i)
+			}
+			if strings.TrimSpace(calls[i].Function.Arguments) == "" {
+				calls[i].Function.Arguments = "{}"
+			}
+		}
+		result.Message.ToolCalls = calls
+	}()
 
 	scanner := bufio.NewScanner(body)
 	scanner.Buffer(make([]byte, 64<<10), 16<<20)
@@ -272,24 +290,7 @@ func assemble(body io.Reader, handler Handler) (Result, error) {
 			}
 		}
 	}
-	if err := scanner.Err(); err != nil {
-		return result, err
-	}
-	if text.Len() > 0 {
-		result.Message.Content = text.String()
-	}
-	result.Message.Reasoning = reasoning.String()
-	result.Message.ReasoningDetails = details.result()
-	for i := range calls {
-		if calls[i].ID == "" {
-			calls[i].ID = fmt.Sprintf("call_%d_%d", time.Now().UnixNano(), i)
-		}
-		if strings.TrimSpace(calls[i].Function.Arguments) == "" {
-			calls[i].Function.Arguments = "{}"
-		}
-	}
-	result.Message.ToolCalls = calls
-	return result, nil
+	return result, scanner.Err()
 }
 
 // detailMerger folds streamed reasoning_details fragments back into whole

@@ -105,7 +105,7 @@ func (t *turn) command(ctx context.Context, name, args string) (schema.PromptRes
 	case "mode":
 		if args == "" {
 			var b strings.Builder
-			fmt.Fprintf(&b, "Current mode: `%s`\n\n", t.s.Mode)
+			fmt.Fprintf(&b, "Current mode: `%s`\n\n", t.mode())
 			for _, m := range modes {
 				fmt.Fprintf(&b, "- `%s` — %s\n", m.id, m.description)
 			}
@@ -135,12 +135,21 @@ func (t *turn) command(ctx context.Context, name, args string) (schema.PromptRes
 		t.say("Reasoning effort set to `%s`.", args)
 
 	case "config":
-		t.configure(ctx, args)
-		t.s.mu.Lock()
-		cfg := t.a.cfg.Get()
-		t.s.Model, t.s.Effort = cfg.Model, cfg.ReasoningEffort
-		t.s.mu.Unlock()
-		optionsChanged()
+		saved := t.configure(ctx, args)
+		_, model := saved["model"]
+		_, effort := saved["reasoning_effort"]
+		if model || effort {
+			cfg := t.a.cfg.Get()
+			t.s.mu.Lock()
+			if model {
+				t.s.Model = cfg.Model
+			}
+			if effort {
+				t.s.Effort = cfg.ReasoningEffort
+			}
+			t.s.mu.Unlock()
+			optionsChanged()
+		}
 
 	case "login":
 		if t.login(ctx, args) {
@@ -190,14 +199,15 @@ func (t *turn) command(ctx context.Context, name, args string) (schema.PromptRes
 }
 
 // configure applies inline key=value pairs, or presents a form of all settings.
-func (t *turn) configure(ctx context.Context, args string) {
+// It returns the settings that were saved.
+func (t *turn) configure(ctx context.Context, args string) map[string]string {
 	values := map[string]string{}
 	if args != "" {
 		for _, pair := range strings.Fields(args) {
 			key, value, ok := strings.Cut(pair, "=")
 			if !ok {
 				t.say("Expected key=value, got `%s`. Keys: %s", pair, strings.Join(config.Keys, ", "))
-				return
+				return nil
 			}
 			values[key] = value
 		}
@@ -221,7 +231,7 @@ func (t *turn) configure(ctx context.Context, args string) {
 		submitted, ok := t.form(ctx, "micro-agent settings (saved to "+t.a.cfg.Path()+")", fields)
 		if !ok {
 			t.showConfig()
-			return
+			return nil
 		}
 		for key, value := range submitted {
 			if value != config.Value(cfg, key) {
@@ -231,7 +241,7 @@ func (t *turn) configure(ctx context.Context, args string) {
 	}
 	if len(values) == 0 {
 		t.say("No changes.")
-		return
+		return nil
 	}
 	err := t.a.cfg.Update(func(c *config.Config) error {
 		for key, value := range values {
@@ -246,7 +256,7 @@ func (t *turn) configure(ctx context.Context, args string) {
 	})
 	if err != nil {
 		t.say("Settings not saved: %v", err)
-		return
+		return nil
 	}
 	keys := make([]string, 0, len(values))
 	for key := range values {
@@ -254,6 +264,7 @@ func (t *turn) configure(ctx context.Context, args string) {
 	}
 	sort.Strings(keys)
 	t.say("Saved %s.", strings.Join(keys, ", "))
+	return values
 }
 
 func (t *turn) showConfig() {

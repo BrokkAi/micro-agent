@@ -300,7 +300,7 @@ You have four tools: shell, read_file, edit_file and write_file, plus any tools 
 	for _, dir := range t.s.Dirs {
 		fmt.Fprintf(&b, "- Additional directory: %s\n", dir)
 	}
-	fmt.Fprintf(&b, "- Platform: %s/%s\n- Shell for bash tool: %s\n- Date: %s\n", runtime.GOOS, runtime.GOARCH, cfg.Shell, time.Now().Format("2006-01-02"))
+	fmt.Fprintf(&b, "- Platform: %s/%s\n- Shell tool runs: %s\n- Date: %s\n", runtime.GOOS, runtime.GOARCH, resolveShell(cfg.Shell).name(), time.Now().Format("2006-01-02"))
 	if t.s.Mode == "plan" {
 		b.WriteString("\nPLAN MODE: you are read-only. Do not modify files or run commands with side effects. Investigate, then present a concrete plan for the user to approve.\n")
 	}
