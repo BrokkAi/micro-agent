@@ -9,7 +9,7 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/BrokkAi/acp-go/schema"
+	schema "github.com/BrokkAi/acp-go/schema/unstable"
 	"github.com/BrokkAi/micro-agent/internal/config"
 )
 
@@ -112,7 +112,7 @@ func (t *turn) command(ctx context.Context, name, args string) (schema.PromptRes
 			t.say("%s", b.String())
 			return done, nil
 		}
-		if err := t.a.setMode(ctx, t.client, t.s, args, true); err != nil {
+		if err := t.a.setMode(ctx, t.s, args, true); err != nil {
 			t.say("%v", err)
 			return done, nil
 		}
@@ -159,7 +159,7 @@ func (t *turn) command(ctx context.Context, name, args string) (schema.PromptRes
 		}
 
 	case "logout":
-		if _, err := t.a.Logout(ctx, t.client, schema.LogoutRequest{}); err != nil {
+		if _, err := t.a.Logout(ctx, schema.LogoutRequest{}); err != nil {
 			t.say("Logout failed: %v", err)
 		} else {
 			t.say("Stored API key removed.")
@@ -218,10 +218,14 @@ func (t *turn) configure(ctx context.Context, args string) map[string]string {
 			f := field{key: key, title: key, value: config.Value(cfg, key)}
 			switch key {
 			case "reasoning_effort":
-				f.enum = append([]string{""}, config.Efforts...)
+				f.options = []schema.EnumOption{{Const: "", Title: "Model default"}}
+				for _, level := range config.Efforts {
+					f.options = append(f.options, schema.EnumOption{Const: level, Title: level})
+				}
 			case "default_mode":
+				f.value = validMode(f.value)
 				for _, m := range modes {
-					f.enum = append(f.enum, m.id)
+					f.options = append(f.options, schema.EnumOption{Const: m.id, Title: m.name, Description: ptr(m.description)})
 				}
 			case "max_turns", "max_tokens", "shell_timeout_seconds":
 				f.integer = true
@@ -233,9 +237,9 @@ func (t *turn) configure(ctx context.Context, args string) map[string]string {
 			t.showConfig()
 			return nil
 		}
-		for key, value := range submitted {
-			if value != config.Value(cfg, key) {
-				values[key] = value
+		for _, f := range fields {
+			if value := submitted[f.key]; value != f.value {
+				values[f.key] = value
 			}
 		}
 	}
@@ -299,25 +303,13 @@ func (t *turn) login(ctx context.Context, key string) bool {
 // field is one form input.
 type field struct {
 	key, title, description, value string
-	enum                           []string
+	options                        []schema.EnumOption
 	integer, required              bool
-}
-
-// formRequest is the elicitation/create payload. It is hand-written because
-// the generated schema type does not carry requestedSchema.
-type formRequest struct {
-	SessionID       schema.SessionId         `json:"sessionId"`
-	Mode            string                   `json:"mode"`
-	Message         string                   `json:"message"`
-	RequestedSchema schema.ElicitationSchema `json:"requestedSchema"`
 }
 
 // form asks the user to fill fields. It returns false when the client cannot
 // show forms or the user declines.
 func (t *turn) form(ctx context.Context, message string, fields []field) (map[string]string, bool) {
-	if !t.a.canForm() {
-		return nil, false
-	}
 	object := schema.ElicitationSchemaTypeObject
 	requested := schema.ElicitationSchema{Type: &object, Properties: map[string]schema.ElicitationPropertySchema{}}
 	for _, f := range fields {
@@ -334,8 +326,8 @@ func (t *turn) form(ctx context.Context, message string, fields []field) (map[st
 			}
 			property.Integer = integer
 		default:
-			str := &schema.StringPropertySchema{Title: ptr(f.title), Description: description, Enum: f.enum}
-			if f.value != "" || len(f.enum) > 0 {
+			str := &schema.StringPropertySchema{Title: ptr(f.title), Description: description, OneOf: f.options}
+			if f.value != "" || len(f.options) > 0 {
 				str.Default = ptr(f.value)
 			}
 			property.String = str
@@ -345,10 +337,10 @@ func (t *turn) form(ctx context.Context, message string, fields []field) (map[st
 			requested.Required = append(requested.Required, f.key)
 		}
 	}
-	var response schema.CreateElicitationResponse
-	err := t.client.Call(ctx, schema.ElicitationCreateMethodName, formRequest{
-		SessionID: t.s.ID, Mode: "form", Message: message, RequestedSchema: requested,
-	}, &response)
+	response, err := t.client.CreateElicitation(ctx, schema.CreateElicitationRequest{
+		Message: message,
+		Form:    &schema.ElicitationFormMode{RequestedSchema: requested, Session: &schema.ElicitationSessionScope{SessionID: t.s.ID}},
+	})
 	if err != nil || response.Accept == nil {
 		return nil, false
 	}

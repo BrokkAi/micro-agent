@@ -11,7 +11,6 @@ import (
 	"os/signal"
 	"strings"
 
-	acpagent "github.com/BrokkAi/acp-go/agent"
 	"github.com/BrokkAi/micro-agent/internal/agent"
 	"github.com/BrokkAi/micro-agent/internal/config"
 )
@@ -51,7 +50,7 @@ func run(configPath string, args []string) error {
 	case len(args) == 0:
 		ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
 		defer stop()
-		return acpagent.New(agent.New(store, version)).Serve(ctx, os.Stdin, os.Stdout)
+		return agent.Serve(ctx, agent.New(store, version), os.Stdin, os.Stdout)
 	case args[0] == "login":
 		return login(store)
 	}

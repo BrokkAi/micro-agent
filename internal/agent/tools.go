@@ -12,8 +12,7 @@ import (
 	"strings"
 	"time"
 
-	acpagent "github.com/BrokkAi/acp-go/agent"
-	"github.com/BrokkAi/acp-go/schema"
+	schema "github.com/BrokkAi/acp-go/schema/unstable"
 	"github.com/BrokkAi/micro-agent/internal/mcp"
 	"github.com/BrokkAi/micro-agent/internal/openrouter"
 )
@@ -54,8 +53,8 @@ func failure(format string, args ...any) toolResult {
 type turn struct {
 	a       *Agent
 	s       *session
-	client  acpagent.Client
-	updates acpagent.SessionUpdater
+	client  *clientConn
+	updates updater
 	mcp     map[string]mcpBinding
 }
 

@@ -1,6 +1,7 @@
 package agent
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -15,8 +16,7 @@ import (
 	"time"
 
 	"github.com/BrokkAi/acp-go"
-	acpagent "github.com/BrokkAi/acp-go/agent"
-	"github.com/BrokkAi/acp-go/schema"
+	schema "github.com/BrokkAi/acp-go/schema/unstable"
 	"github.com/BrokkAi/micro-agent/internal/config"
 )
 
@@ -67,20 +67,40 @@ func textChunks(text string) []string {
 }
 
 type harness struct {
-	t       *testing.T
-	conn    *acp.Connection
-	init    acp.Initialization
-	router  *fakeRouter
-	store   *config.Store
-	dir     string
-	mu      sync.Mutex
-	updates []schema.SessionNotification
-	answer  schema.PermissionOptionId
+	t      *testing.T
+	conn   *acp.Connection
+	init   schema.InitializeResponse
+	router *fakeRouter
+	store  *config.Store
+	dir    string
+	answer schema.PermissionOptionId
+
+	mu       sync.Mutex
+	updates  []schema.SessionNotification
+	raw      []byte // everything the agent wrote, in order
+	handlers map[string]func(json.RawMessage) (any, error)
 }
 
+// newHarness starts an agent and initializes it with caps.
 func newHarness(t *testing.T, caps schema.ClientCapabilities) *harness {
 	t.Helper()
-	h := &harness{t: t, router: &fakeRouter{}, dir: t.TempDir(), answer: "allow_once"}
+	h := startHarness(t)
+	var err error
+	h.init, err = h.initialize(schema.InitializeRequest{
+		ProtocolVersion:    schema.ProtocolVersion(acp.Version),
+		ClientCapabilities: &caps,
+		ClientInfo:         &schema.Implementation{Name: "test", Version: "1"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return h
+}
+
+// startHarness starts an agent without initializing it.
+func startHarness(t *testing.T) *harness {
+	t.Helper()
+	h := &harness{t: t, router: &fakeRouter{}, dir: t.TempDir(), answer: "allow_once", handlers: map[string]func(json.RawMessage) (any, error){}}
 	server := httptest.NewServer(h.router)
 	t.Cleanup(server.Close)
 	store, err := config.Load(filepath.Join(t.TempDir(), "config.json"))
@@ -99,10 +119,16 @@ func newHarness(t *testing.T, caps schema.ClientCapabilities) *harness {
 	clientIn, agentOut := io.Pipe()
 	ctx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(cancel)
-	go func() { _ = acpagent.New(New(store, "test")).Serve(ctx, agentIn, agentOut) }()
+	go func() { _ = Serve(ctx, New(store, "test"), agentIn, agentOut) }()
 
 	handler := func(_ context.Context, method string, raw json.RawMessage) (any, error) {
-		if method == schema.SessionRequestPermissionMethodName {
+		h.mu.Lock()
+		handle := h.handlers[method]
+		h.mu.Unlock()
+		switch {
+		case handle != nil:
+			return handle(raw)
+		case method == schema.SessionRequestPermissionMethodName:
 			return schema.RequestPermissionResponse{Outcome: schema.RequestPermissionOutcome{Selected: &schema.SelectedPermissionOutcome{OptionID: h.answer}}}, nil
 		}
 		return nil, &acp.RPCError{Code: -32601, Message: method}
@@ -119,13 +145,76 @@ func newHarness(t *testing.T, caps schema.ClientCapabilities) *harness {
 		}
 		return nil
 	}
-	h.conn = acp.Connect(clientIn, clientOut, handler, notifications)
+	h.conn = acp.Connect(recorder{clientIn, h}, clientOut, handler, notifications)
 	t.Cleanup(func() { h.conn.Close() })
-	h.init, err = h.conn.InitializeWithInfo(context.Background(), caps, acp.ClientInfo{Name: "test", Version: "1"})
-	if err != nil {
-		t.Fatal(err)
-	}
 	return h
+}
+
+// recorder keeps a copy of the agent's output for frame-order assertions.
+type recorder struct {
+	io.ReadCloser
+	h *harness
+}
+
+func (r recorder) Read(p []byte) (int, error) {
+	n, err := r.ReadCloser.Read(p)
+	r.h.mu.Lock()
+	r.h.raw = append(r.h.raw, p[:n]...)
+	r.h.mu.Unlock()
+	return n, err
+}
+
+// wireFrame is one JSON-RPC message as the client received it.
+type wireFrame struct {
+	ID     json.RawMessage `json:"id"`
+	Method string          `json:"method"`
+	Params json.RawMessage `json:"params"`
+	Result json.RawMessage `json:"result"`
+}
+
+func (h *harness) frames() []wireFrame {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	var frames []wireFrame
+	for _, line := range bytes.Split(bytes.TrimSpace(h.raw), []byte("\n")) {
+		var f wireFrame
+		if err := json.Unmarshal(line, &f); err != nil {
+			h.t.Fatalf("frame %q: %v", line, err)
+		}
+		frames = append(frames, f)
+	}
+	return frames
+}
+
+// on answers the agent's requests for method with handle.
+func (h *harness) on(method string, handle func(json.RawMessage) (any, error)) {
+	h.mu.Lock()
+	h.handlers[method] = handle
+	h.mu.Unlock()
+}
+
+// send makes a raw call and decodes the result with unstable types.
+func send[T any](h *harness, method string, params any) (T, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	var result T
+	err := h.conn.Call(ctx, method, params, &result)
+	return result, err
+}
+
+// initialize sends a raw initialize, so tests can offer unstable client
+// capabilities or other protocol versions.
+func (h *harness) initialize(params any) (schema.InitializeResponse, error) {
+	return send[schema.InitializeResponse](h, schema.InitializeMethodName, params)
+}
+
+func (h *harness) newSession() schema.SessionId {
+	h.t.Helper()
+	session, err := send[schema.NewSessionResponse](h, schema.SessionNewMethodName, schema.NewSessionRequest{Cwd: h.dir, MCPServers: []schema.McpServer{}})
+	if err != nil {
+		h.t.Fatal(err)
+	}
+	return session.SessionID
 }
 
 func (h *harness) kinds() []schema.SessionUpdateKind {
@@ -138,15 +227,13 @@ func (h *harness) kinds() []schema.SessionUpdateKind {
 	return kinds
 }
 
-func (h *harness) prompt(session acp.Session, text string) schema.StopReason {
+func (h *harness) prompt(session schema.SessionId, text string) schema.PromptResponse {
 	h.t.Helper()
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-	reason, err := h.conn.Prompt(ctx, session, text)
+	response, err := send[schema.PromptResponse](h, schema.SessionPromptMethodName, schema.PromptRequest{SessionID: session, Prompt: []schema.ContentBlock{textBlock(text)}})
 	if err != nil {
 		h.t.Fatal(err)
 	}
-	return reason
+	return response
 }
 
 func TestPromptRunsToolWithPermission(t *testing.T) {
@@ -155,11 +242,8 @@ func TestPromptRunsToolWithPermission(t *testing.T) {
 		toolCallChunks("call_1", "write_file", map[string]string{"path": "hello.txt", "content": "hi\n"}),
 		textChunks("Created the file."),
 	}
-	session, err := h.conn.NewSession(context.Background(), h.dir)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if reason := h.prompt(session, "make hello.txt"); reason != schema.StopReasonEndTurn {
+	session := h.newSession()
+	if reason := h.prompt(session, "make hello.txt").StopReason; reason != schema.StopReasonEndTurn {
 		t.Fatalf("stop reason %s", reason)
 	}
 	data, err := os.ReadFile(filepath.Join(h.dir, "hello.txt"))
@@ -179,14 +263,14 @@ func TestPromptRunsToolWithPermission(t *testing.T) {
 	}
 
 	// The session is persisted, listed, and replayed on load.
-	list, err := h.conn.ListSessions(context.Background(), h.init, schema.ListSessionsRequest{Cwd: &h.dir})
+	list, err := send[schema.ListSessionsResponse](h, schema.SessionListMethodName, schema.ListSessionsRequest{Cwd: &h.dir})
 	if err != nil || len(list.Sessions) != 1 || list.Sessions[0].Title == nil || *list.Sessions[0].Title != "make hello.txt" {
 		t.Fatalf("list = %+v, %v", list, err)
 	}
 	h.mu.Lock()
 	h.updates = nil
 	h.mu.Unlock()
-	if _, err := h.conn.LoadSession(context.Background(), h.init, schema.LoadSessionRequest{SessionID: session.SessionID, Cwd: h.dir, MCPServers: []schema.McpServer{}}); err != nil {
+	if _, err := send[schema.LoadSessionResponse](h, schema.SessionLoadMethodName, schema.LoadSessionRequest{SessionID: session, Cwd: h.dir, MCPServers: []schema.McpServer{}}); err != nil {
 		t.Fatal(err)
 	}
 	kinds = fmt.Sprint(h.kinds())
@@ -204,10 +288,7 @@ func TestRejectedPermissionDoesNotWrite(t *testing.T) {
 		toolCallChunks("call_1", "shell", map[string]string{"command": "echo hi > out.txt"}),
 		textChunks("ok"),
 	}
-	session, err := h.conn.NewSession(context.Background(), h.dir)
-	if err != nil {
-		t.Fatal(err)
-	}
+	session := h.newSession()
 	h.prompt(session, "run it")
 	if _, err := os.Stat(filepath.Join(h.dir, "out.txt")); err == nil {
 		t.Fatal("command ran despite rejection")
@@ -220,10 +301,7 @@ func TestRejectedPermissionDoesNotWrite(t *testing.T) {
 
 func TestSlashConfigUpdatesFile(t *testing.T) {
 	h := newHarness(t, schema.ClientCapabilities{})
-	session, err := h.conn.NewSession(context.Background(), h.dir)
-	if err != nil {
-		t.Fatal(err)
-	}
+	session := h.newSession()
 	h.prompt(session, "/config max_turns=7 reasoning_effort=high")
 	cfg := h.store.Get()
 	if cfg.MaxTurns != 7 || cfg.ReasoningEffort != "high" {
@@ -267,10 +345,7 @@ func TestShellRunsLocally(t *testing.T) {
 		toolCallChunks("call_1", "shell", map[string]string{"command": "echo micro-agent-ok"}),
 		textChunks("done"),
 	}
-	session, err := h.conn.NewSession(context.Background(), h.dir)
-	if err != nil {
-		t.Fatal(err)
-	}
+	session := h.newSession()
 	h.prompt(session, "run it")
 	messages := h.router.requests[1]["messages"].([]any)
 	content := messages[len(messages)-1].(map[string]any)["content"].(string)
@@ -315,7 +390,7 @@ func TestDeletedSessionIsNotResaved(t *testing.T) {
 	if err := a.save(s); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := a.DeleteSession(context.Background(), nil, schema.DeleteSessionRequest{SessionID: s.ID}); err != nil {
+	if _, err := a.DeleteSession(context.Background(), schema.DeleteSessionRequest{SessionID: s.ID}); err != nil {
 		t.Fatal(err)
 	}
 	if err := a.save(s); err != nil {
@@ -328,10 +403,7 @@ func TestDeletedSessionIsNotResaved(t *testing.T) {
 
 func TestConfigKeepsSessionModel(t *testing.T) {
 	h := newHarness(t, schema.ClientCapabilities{})
-	session, err := h.conn.NewSession(context.Background(), h.dir)
-	if err != nil {
-		t.Fatal(err)
-	}
+	session := h.newSession()
 	h.prompt(session, "/model other/model")
 	if err := h.store.Update(func(c *config.Config) error { c.Model = "global/model"; return nil }); err != nil {
 		t.Fatal(err)

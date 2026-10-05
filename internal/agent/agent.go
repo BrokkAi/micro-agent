@@ -14,8 +14,7 @@ import (
 	"time"
 
 	"github.com/BrokkAi/acp-go"
-	acpagent "github.com/BrokkAi/acp-go/agent"
-	"github.com/BrokkAi/acp-go/schema"
+	schema "github.com/BrokkAi/acp-go/schema/unstable"
 	"github.com/BrokkAi/micro-agent/internal/config"
 	"github.com/BrokkAi/micro-agent/internal/mcp"
 )
@@ -26,10 +25,12 @@ const authMethodID = "openrouter-api-key"
 type Agent struct {
 	cfg     *config.Store
 	version string
+	client  *clientConn // set by Serve
 
 	mu       sync.Mutex
 	sessions map[schema.SessionId]*session
 	caps     schema.ClientCapabilities
+	offered  *schema.AgentCapabilities // nil until initialize succeeds
 }
 
 // New returns an agent backed by the given configuration.
@@ -37,26 +38,25 @@ func New(cfg *config.Store, version string) *Agent {
 	return &Agent{cfg: cfg, version: version, sessions: map[schema.SessionId]*session{}}
 }
 
-func (a *Agent) Initialize(_ context.Context, _ acpagent.Client, request schema.InitializeRequest) (schema.InitializeResponse, error) {
+func (a *Agent) Initialize(_ context.Context, request schema.InitializeRequest) (schema.InitializeResponse, error) {
+	var caps schema.ClientCapabilities
 	if request.ClientCapabilities != nil {
-		a.mu.Lock()
-		a.caps = *request.ClientCapabilities
-		a.mu.Unlock()
+		caps = *request.ClientCapabilities
 	}
 	methods := []schema.AuthMethod{{Agent: &schema.AuthMethodAgent{
 		ID:          authMethodID,
 		Name:        "OpenRouter API key",
 		Description: ptr("Uses OPENROUTER_API_KEY or the api_key in " + a.cfg.Path() + "; set it with /login."),
 	}}}
-	if a.capable(func(c schema.ClientCapabilities) bool { return c.Auth != nil && isTrue(c.Auth.Terminal) }) {
+	if caps.Auth != nil && isTrue(caps.Auth.Terminal) {
 		methods = append(methods, schema.AuthMethod{Terminal: &schema.AuthMethodTerminal{
 			ID:   "terminal-login",
 			Name: "Enter OpenRouter API key in a terminal",
 			Args: []string{"login"},
 		}})
 	}
-	return schema.InitializeResponse{
-		ProtocolVersion: acp.Version,
+	response := schema.InitializeResponse{
+		ProtocolVersion: schema.ProtocolVersion(acp.Version),
 		AgentInfo:       &schema.Implementation{Name: "micro-agent", Title: ptr("Brokk micro-agent"), Version: a.version},
 		AuthMethods:     methods,
 		AgentCapabilities: &schema.AgentCapabilities{
@@ -72,10 +72,17 @@ func (a *Agent) Initialize(_ context.Context, _ acpagent.Client, request schema.
 			},
 			Auth: &schema.AgentAuthCapabilities{Logout: &schema.LogoutCapabilities{}},
 		},
-	}, nil
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.offered != nil {
+		return schema.InitializeResponse{}, &acp.RPCError{Code: int(schema.ErrorCodeInvalidRequest), Message: "agent is already initialized"}
+	}
+	a.caps, a.offered = caps, response.AgentCapabilities
+	return response, nil
 }
 
-func (a *Agent) Authenticate(_ context.Context, _ acpagent.Client, request schema.AuthenticateRequest) (schema.AuthenticateResponse, error) {
+func (a *Agent) Authenticate(_ context.Context, request schema.AuthenticateRequest) (schema.AuthenticateResponse, error) {
 	if request.MethodID != authMethodID {
 		return schema.AuthenticateResponse{}, invalidParams("unknown auth method " + string(request.MethodID))
 	}
@@ -85,7 +92,7 @@ func (a *Agent) Authenticate(_ context.Context, _ acpagent.Client, request schem
 	return schema.AuthenticateResponse{}, nil
 }
 
-func (a *Agent) Logout(context.Context, acpagent.Client, schema.LogoutRequest) (schema.LogoutResponse, error) {
+func (a *Agent) Logout(context.Context, schema.LogoutRequest) (schema.LogoutResponse, error) {
 	return schema.LogoutResponse{}, a.cfg.Update(func(c *config.Config) error {
 		c.APIKey = ""
 		return nil
@@ -125,6 +132,10 @@ func (a *Agent) canForm() bool {
 	return a.capable(func(c schema.ClientCapabilities) bool { return c.Elicitation != nil && c.Elicitation.Form != nil })
 }
 
+func (a *Agent) canURL() bool {
+	return a.capable(func(c schema.ClientCapabilities) bool { return c.Elicitation != nil && c.Elicitation.URL != nil })
+}
+
 // Modes.
 
 type mode struct {
@@ -155,12 +166,12 @@ func modeState(current string) *schema.SessionModeState {
 	return state
 }
 
-func (a *Agent) SetMode(ctx context.Context, client acpagent.Client, request schema.SetSessionModeRequest) (schema.SetSessionModeResponse, error) {
+func (a *Agent) SetMode(ctx context.Context, request schema.SetSessionModeRequest) (schema.SetSessionModeResponse, error) {
 	s, err := a.lookup(request.SessionID)
 	if err != nil {
 		return schema.SetSessionModeResponse{}, err
 	}
-	if err := a.setMode(ctx, client, s, string(request.ModeID), false); err != nil {
+	if err := a.setMode(ctx, s, string(request.ModeID), false); err != nil {
 		return schema.SetSessionModeResponse{}, err
 	}
 	return schema.SetSessionModeResponse{}, nil
@@ -169,7 +180,7 @@ func (a *Agent) SetMode(ctx context.Context, client acpagent.Client, request sch
 // setMode switches the session mode and keeps the mode config option in sync.
 // announceMode also emits current_mode_update, for changes the client did not
 // initiate.
-func (a *Agent) setMode(ctx context.Context, client acpagent.Client, s *session, id string, announceMode bool) error {
+func (a *Agent) setMode(ctx context.Context, s *session, id string, announceMode bool) error {
 	if validMode(id) != id {
 		return invalidParams("unknown mode " + id)
 	}
@@ -178,9 +189,9 @@ func (a *Agent) setMode(ctx context.Context, client acpagent.Client, s *session,
 	s.mu.Unlock()
 	_ = a.save(s)
 	if announceMode {
-		_ = notify(ctx, client, s.ID, schema.SessionUpdate{CurrentModeUpdate: &schema.CurrentModeUpdate{CurrentModeID: schema.SessionModeId(id)}})
+		_ = a.notify(ctx, s.ID, schema.SessionUpdate{CurrentModeUpdate: &schema.CurrentModeUpdate{CurrentModeID: schema.SessionModeId(id)}})
 	}
-	return notify(ctx, client, s.ID, schema.SessionUpdate{ConfigOptionUpdate: &schema.ConfigOptionUpdate{ConfigOptions: a.configOptions(s)}})
+	return a.notify(ctx, s.ID, schema.SessionUpdate{ConfigOptionUpdate: &schema.ConfigOptionUpdate{ConfigOptions: a.configOptions(s)}})
 }
 
 // Config options.
@@ -219,7 +230,7 @@ func (a *Agent) configOptions(s *session) []schema.SessionConfigOption {
 	}
 }
 
-func (a *Agent) SetConfigOption(ctx context.Context, client acpagent.Client, request schema.SetSessionConfigOptionRequest) (schema.SetSessionConfigOptionResponse, error) {
+func (a *Agent) SetConfigOption(ctx context.Context, request schema.SetSessionConfigOptionRequest) (schema.SetSessionConfigOptionResponse, error) {
 	s, err := a.lookup(request.SessionID)
 	if err != nil {
 		return schema.SetSessionConfigOptionResponse{}, err
@@ -236,7 +247,7 @@ func (a *Agent) SetConfigOption(ctx context.Context, client acpagent.Client, req
 		s.mu.Lock()
 		s.Mode = value
 		s.mu.Unlock()
-		_ = notify(ctx, client, s.ID, schema.SessionUpdate{CurrentModeUpdate: &schema.CurrentModeUpdate{CurrentModeID: schema.SessionModeId(value)}})
+		_ = a.notify(ctx, s.ID, schema.SessionUpdate{CurrentModeUpdate: &schema.CurrentModeUpdate{CurrentModeID: schema.SessionModeId(value)}})
 	case "model":
 		if err := a.setModel(s, value); err != nil {
 			return schema.SetSessionConfigOptionResponse{}, err
@@ -291,8 +302,8 @@ func (a *Agent) setEffort(s *session, effort string) error {
 var unsafeName = regexp.MustCompile(`[^a-zA-Z0-9_-]+`)
 
 // connectMCP connects the client-provided and globally configured servers
-// concurrently. Failures are reported to the user and otherwise skipped.
-func (a *Agent) connectMCP(ctx context.Context, client acpagent.Client, s *session, servers []schema.McpServer) []*mcp.Client {
+// concurrently. Failed servers are skipped, with a notice for the user.
+func (a *Agent) connectMCP(ctx context.Context, s *session, servers []schema.McpServer) ([]*mcp.Client, []schema.SessionUpdate) {
 	var configs []mcp.Config
 	for _, server := range servers {
 		switch {
@@ -320,6 +331,7 @@ func (a *Agent) connectMCP(ctx context.Context, client acpagent.Client, s *sessi
 	}
 	info := mcp.ClientInfo{Name: "micro-agent", Version: a.version, Roots: append([]string{s.Cwd}, s.Dirs...)}
 	clients := make([]*mcp.Client, len(configs))
+	failures := make([]error, len(configs))
 	var wg sync.WaitGroup
 	for i, c := range configs {
 		wg.Go(func() {
@@ -334,19 +346,22 @@ func (a *Agent) connectMCP(ctx context.Context, client acpagent.Client, s *sessi
 					_ = connected.Close()
 				}
 				fmt.Fprintf(os.Stderr, "micro-agent: MCP server %s: %v\n", c.Name, err)
-				go func() {
-					time.Sleep(200 * time.Millisecond)
-					_ = notify(context.Background(), client, s.ID, schema.SessionUpdate{AgentMessageChunk: &schema.ContentChunk{
-						Content: textBlock(fmt.Sprintf("⚠️ MCP server `%s` failed to start: %v\n\n", c.Name, err)),
-					}})
-				}()
+				failures[i] = err
 				return
 			}
 			clients[i] = connected
 		})
 	}
 	wg.Wait()
-	return slices.DeleteFunc(clients, func(c *mcp.Client) bool { return c == nil })
+	var notices []schema.SessionUpdate
+	for i, err := range failures {
+		if err != nil {
+			notices = append(notices, schema.SessionUpdate{AgentMessageChunk: &schema.ContentChunk{
+				Content: textBlock(fmt.Sprintf("⚠️ MCP server `%s` failed to start: %v\n\n", configs[i].Name, err)),
+			}})
+		}
+	}
+	return slices.DeleteFunc(clients, func(c *mcp.Client) bool { return c == nil }), notices
 }
 
 // mcpToolName maps a server tool to the model-facing name.

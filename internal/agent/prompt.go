@@ -12,12 +12,11 @@ import (
 	"time"
 
 	"github.com/BrokkAi/acp-go"
-	acpagent "github.com/BrokkAi/acp-go/agent"
-	"github.com/BrokkAi/acp-go/schema"
+	schema "github.com/BrokkAi/acp-go/schema/unstable"
 	"github.com/BrokkAi/micro-agent/internal/openrouter"
 )
 
-func (a *Agent) Prompt(parent context.Context, client acpagent.Client, request schema.PromptRequest, updates acpagent.SessionUpdater) (schema.PromptResponse, error) {
+func (a *Agent) Prompt(parent context.Context, request schema.PromptRequest) (schema.PromptResponse, error) {
 	s, err := a.lookup(request.SessionID)
 	if err != nil {
 		return schema.PromptResponse{}, err
@@ -37,7 +36,8 @@ func (a *Agent) Prompt(parent context.Context, client acpagent.Client, request s
 		s.mu.Unlock()
 	}()
 
-	t := &turn{a: a, s: s, client: client, updates: updates}
+	updates := updater{a: a, id: s.ID}
+	t := &turn{a: a, s: s, client: a.client, updates: updates}
 	if name, args, ok := parseCommand(request.Prompt); ok {
 		return t.command(ctx, name, args)
 	}

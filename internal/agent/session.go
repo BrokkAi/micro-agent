@@ -15,8 +15,7 @@ import (
 	"sync"
 	"time"
 
-	acpagent "github.com/BrokkAi/acp-go/agent"
-	"github.com/BrokkAi/acp-go/schema"
+	schema "github.com/BrokkAi/acp-go/schema/unstable"
 	"github.com/BrokkAi/micro-agent/internal/mcp"
 	"github.com/BrokkAi/micro-agent/internal/openrouter"
 )
@@ -118,16 +117,19 @@ func (a *Agent) lookup(id schema.SessionId) (*session, error) {
 	return s, nil
 }
 
-// open registers s, connects its MCP servers and announces commands.
-func (a *Agent) open(ctx context.Context, client acpagent.Client, s *session, servers []schema.McpServer) {
+// open registers s and connects its MCP servers. It returns notices about
+// servers that failed, for the caller to announce.
+func (a *Agent) open(ctx context.Context, s *session, servers []schema.McpServer) []schema.SessionUpdate {
 	s.decisions = map[string]bool{}
-	s.servers = a.connectMCP(ctx, client, s, servers)
+	var notices []schema.SessionUpdate
+	s.servers, notices = a.connectMCP(ctx, s, servers)
 	a.mu.Lock()
 	if old := a.sessions[s.ID]; old != nil {
 		a.shutdown(old)
 	}
 	a.sessions[s.ID] = s
 	a.mu.Unlock()
+	return notices
 }
 
 // shutdown cancels work and releases MCP connections.
@@ -144,7 +146,7 @@ func (a *Agent) shutdown(s *session) {
 	}
 }
 
-func (a *Agent) NewSession(ctx context.Context, client acpagent.Client, request schema.NewSessionRequest) (schema.NewSessionResponse, error) {
+func (a *Agent) NewSession(ctx context.Context, request schema.NewSessionRequest) (schema.NewSessionResponse, error) {
 	if !filepath.IsAbs(request.Cwd) {
 		return schema.NewSessionResponse{}, invalidParams("cwd must be an absolute path")
 	}
@@ -157,8 +159,10 @@ func (a *Agent) NewSession(ctx context.Context, client acpagent.Client, request 
 		Model:  cfg.Model,
 		Effort: cfg.ReasoningEffort,
 	}}
-	a.open(ctx, client, s, request.MCPServers)
-	a.announceLater(client, s)
+	notices := a.open(ctx, s, request.MCPServers)
+	// The client learns the session ID from the response, so its updates go
+	// out right behind it.
+	a.announce(s, notices, updater{a: a, id: s.ID, queued: true})
 	return schema.NewSessionResponse{
 		SessionID:     s.ID,
 		Modes:         modeState(s.Mode),
@@ -166,29 +170,29 @@ func (a *Agent) NewSession(ctx context.Context, client acpagent.Client, request 
 	}, nil
 }
 
-func (a *Agent) LoadSession(ctx context.Context, client acpagent.Client, request schema.LoadSessionRequest) (schema.LoadSessionResponse, error) {
-	s, err := a.restore(ctx, client, request.SessionID, request.Cwd, request.AdditionalDirectories, request.MCPServers)
+func (a *Agent) LoadSession(ctx context.Context, request schema.LoadSessionRequest) (schema.LoadSessionResponse, error) {
+	s, notices, err := a.restore(ctx, request.SessionID, request.Cwd, request.AdditionalDirectories, request.MCPServers)
 	if err != nil {
 		return schema.LoadSessionResponse{}, err
 	}
-	a.replay(ctx, client, s)
-	a.announce(ctx, client, s)
+	a.replay(ctx, s)
+	a.announce(s, notices, updater{a: a, id: s.ID})
 	return schema.LoadSessionResponse{Modes: modeState(s.Mode), ConfigOptions: a.configOptions(s)}, nil
 }
 
-func (a *Agent) ResumeSession(ctx context.Context, client acpagent.Client, request schema.ResumeSessionRequest) (schema.ResumeSessionResponse, error) {
-	s, err := a.restore(ctx, client, request.SessionID, request.Cwd, request.AdditionalDirectories, request.MCPServers)
+func (a *Agent) ResumeSession(ctx context.Context, request schema.ResumeSessionRequest) (schema.ResumeSessionResponse, error) {
+	s, notices, err := a.restore(ctx, request.SessionID, request.Cwd, request.AdditionalDirectories, request.MCPServers)
 	if err != nil {
 		return schema.ResumeSessionResponse{}, err
 	}
-	a.announceLater(client, s)
+	a.announce(s, notices, updater{a: a, id: s.ID})
 	return schema.ResumeSessionResponse{Modes: modeState(s.Mode), ConfigOptions: a.configOptions(s)}, nil
 }
 
-func (a *Agent) restore(ctx context.Context, client acpagent.Client, id schema.SessionId, cwd string, dirs []string, servers []schema.McpServer) (*session, error) {
+func (a *Agent) restore(ctx context.Context, id schema.SessionId, cwd string, dirs []string, servers []schema.McpServer) (*session, []schema.SessionUpdate, error) {
 	r, err := a.loadRecord(id)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	if cwd != "" {
 		r.Cwd = cwd
@@ -198,11 +202,10 @@ func (a *Agent) restore(ctx context.Context, client acpagent.Client, id schema.S
 	}
 	r.Mode = validMode(r.Mode)
 	s := &session{record: r}
-	a.open(ctx, client, s, servers)
-	return s, nil
+	return s, a.open(ctx, s, servers), nil
 }
 
-func (a *Agent) CloseSession(_ context.Context, _ acpagent.Client, request schema.CloseSessionRequest) (schema.CloseSessionResponse, error) {
+func (a *Agent) CloseSession(_ context.Context, request schema.CloseSessionRequest) (schema.CloseSessionResponse, error) {
 	a.mu.Lock()
 	s := a.sessions[request.SessionID]
 	delete(a.sessions, request.SessionID)
@@ -214,7 +217,7 @@ func (a *Agent) CloseSession(_ context.Context, _ acpagent.Client, request schem
 	return schema.CloseSessionResponse{}, nil
 }
 
-func (a *Agent) DeleteSession(_ context.Context, _ acpagent.Client, request schema.DeleteSessionRequest) (schema.DeleteSessionResponse, error) {
+func (a *Agent) DeleteSession(_ context.Context, request schema.DeleteSessionRequest) (schema.DeleteSessionResponse, error) {
 	a.mu.Lock()
 	s := a.sessions[request.SessionID]
 	delete(a.sessions, request.SessionID)
@@ -237,7 +240,7 @@ func (a *Agent) DeleteSession(_ context.Context, _ acpagent.Client, request sche
 
 const listPageSize = 50
 
-func (a *Agent) ListSessions(_ context.Context, _ acpagent.Client, request schema.ListSessionsRequest) (schema.ListSessionsResponse, error) {
+func (a *Agent) ListSessions(_ context.Context, request schema.ListSessionsRequest) (schema.ListSessionsResponse, error) {
 	entries, err := os.ReadDir(a.sessionDir())
 	if err != nil && !errors.Is(err, os.ErrNotExist) {
 		return schema.ListSessionsResponse{}, err
@@ -282,8 +285,8 @@ func (a *Agent) ListSessions(_ context.Context, _ acpagent.Client, request schem
 }
 
 // replay streams a restored conversation back to the client as session updates.
-func (a *Agent) replay(ctx context.Context, client acpagent.Client, s *session) {
-	send := func(update schema.SessionUpdate) { _ = notify(ctx, client, s.ID, update) }
+func (a *Agent) replay(ctx context.Context, s *session) {
+	send := func(update schema.SessionUpdate) { _ = a.notify(ctx, s.ID, update) }
 	results := map[string]openrouter.Message{}
 	for _, m := range s.Messages {
 		if m.Role == "tool" {
@@ -334,23 +337,13 @@ func (a *Agent) replay(ctx context.Context, client acpagent.Client, s *session) 
 	}
 }
 
-// announce publishes the command list and title for a session.
-func (a *Agent) announce(ctx context.Context, client acpagent.Client, s *session) {
-	_ = notify(ctx, client, s.ID, schema.SessionUpdate{AvailableCommandsUpdate: &schema.AvailableCommandsUpdate{AvailableCommands: commandList()}})
+// announce publishes the command list, title and MCP notices for a session.
+func (a *Agent) announce(s *session, notices []schema.SessionUpdate, updates updater) {
+	_ = updates.Update(schema.SessionUpdate{AvailableCommandsUpdate: &schema.AvailableCommandsUpdate{AvailableCommands: commandList()}})
 	if s.Title != "" {
-		_ = notify(ctx, client, s.ID, schema.SessionUpdate{SessionInfoUpdate: &schema.SessionInfoUpdate{Title: ptr(s.Title)}})
+		_ = updates.Update(schema.SessionUpdate{SessionInfoUpdate: &schema.SessionInfoUpdate{Title: ptr(s.Title)}})
 	}
-}
-
-// announceLater runs announce after the session/new response has been sent,
-// since clients may drop updates for a session ID they have not seen yet.
-func (a *Agent) announceLater(client acpagent.Client, s *session) {
-	go func() {
-		time.Sleep(100 * time.Millisecond)
-		a.announce(context.Background(), client, s)
-	}()
-}
-
-func notify(ctx context.Context, client acpagent.Client, id schema.SessionId, update schema.SessionUpdate) error {
-	return client.Notify(ctx, schema.SessionUpdateMethodName, schema.SessionNotification{SessionID: id, Update: update})
+	for _, notice := range notices {
+		_ = updates.Update(notice)
+	}
 }
