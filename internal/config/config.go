@@ -204,6 +204,9 @@ func (s *Store) refresh(force bool) error {
 
 func validate(cfg Config) error {
 	for name, server := range cfg.MCPServers {
+		if (server.Command == "") == (server.URL == "") {
+			return fmt.Errorf("mcp_servers.%s: set exactly one of command or url", name)
+		}
 		switch server.Transport {
 		case "":
 		case "sse":
@@ -217,6 +220,9 @@ func validate(cfg Config) error {
 	return nil
 }
 
+// rename is os.Rename; tests replace it to make the rename fail.
+var rename = os.Rename
+
 // write saves cfg through a temporary file and a rename, so other processes
 // never read a partial file. It returns the new file's info.
 func write(path string, cfg Config) (os.FileInfo, error) {
@@ -224,10 +230,8 @@ func write(path string, cfg Config) (os.FileInfo, error) {
 	if err != nil {
 		return nil, err
 	}
-	// Replace the target of a symlinked config, not the link.
-	if real, err := filepath.EvalSymlinks(path); err == nil {
-		path = real
-	}
+	data = append(data, '\n')
+	path = resolve(path)
 	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 		return nil, err
 	}
@@ -236,7 +240,7 @@ func write(path string, cfg Config) (os.FileInfo, error) {
 		return nil, err
 	}
 	var info os.FileInfo
-	_, err = f.Write(append(data, '\n'))
+	_, err = f.Write(data)
 	if err == nil {
 		err = f.Sync()
 	}
@@ -246,14 +250,41 @@ func write(path string, cfg Config) (os.FileInfo, error) {
 	if closeErr := f.Close(); err == nil {
 		err = closeErr
 	}
-	if err == nil {
-		err = os.Rename(f.Name(), path)
-	}
 	if err != nil {
 		_ = os.Remove(f.Name())
 		return nil, err
 	}
+	if err := rename(f.Name(), path); err != nil {
+		_ = os.Remove(f.Name())
+		// A bind-mounted config.json (Docker, Kubernetes subPath) cannot be
+		// replaced (EBUSY) but can still be written in place.
+		if err := os.WriteFile(path, data, 0o600); err != nil {
+			return nil, err
+		}
+		return os.Stat(path)
+	}
 	return info, nil
+}
+
+// resolve follows symlinks so that a save replaces the target of a symlinked
+// config.json and keeps the link.
+func resolve(path string) string {
+	if real, err := filepath.EvalSymlinks(path); err == nil {
+		return real
+	}
+	// EvalSymlinks fails on a dangling link. Follow it by hand so the save
+	// creates the target, as os.WriteFile would.
+	for range 255 { // the link limit EvalSymlinks uses
+		link, err := os.Readlink(path)
+		if err != nil {
+			break
+		}
+		if !filepath.IsAbs(link) {
+			link = filepath.Join(filepath.Dir(path), link)
+		}
+		path = link
+	}
+	return path
 }
 
 // Kind is the type of a key from Keys: "integer", "boolean" or "string".

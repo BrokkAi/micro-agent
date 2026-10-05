@@ -2,6 +2,7 @@ package config
 
 import (
 	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -165,23 +166,87 @@ func TestWriteIsAtomicAndPrivate(t *testing.T) {
 }
 
 func TestWriteFollowsSymlink(t *testing.T) {
+	for _, tc := range []struct {
+		name                  string
+		exists, relative, via bool // via: config.json links to a second link
+	}{
+		{name: "existing", exists: true},
+		{name: "dangling"},
+		{name: "dangling relative", relative: true},
+		{name: "dangling chain", relative: true, via: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			target := filepath.Join(dir, "dotfiles", "real.json")
+			if tc.exists {
+				if err := os.MkdirAll(filepath.Dir(target), 0o700); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.WriteFile(target, []byte(`{}`), 0o600); err != nil {
+					t.Fatal(err)
+				}
+			}
+			dest := target
+			if tc.relative {
+				dest = filepath.Join("dotfiles", "real.json")
+			}
+			link := filepath.Join(dir, "config.json")
+			if tc.via {
+				if err := os.Symlink(dest, filepath.Join(dir, "mid.json")); err != nil {
+					t.Skip("symlinks unavailable:", err)
+				}
+				dest = "mid.json"
+			}
+			if err := os.Symlink(dest, link); err != nil {
+				t.Skip("symlinks unavailable:", err)
+			}
+			if err := load(t, link).Update(setModel("a/one")); err != nil {
+				t.Fatal(err)
+			}
+			for _, l := range []string{link, filepath.Join(dir, "mid.json")} {
+				if info, err := os.Lstat(l); err == nil && info.Mode()&os.ModeSymlink == 0 {
+					t.Fatalf("%s replaced by a file", l)
+				}
+			}
+			if model := onDisk(t, target).Model; model != "a/one" {
+				t.Fatalf("target model = %q", model)
+			}
+		})
+	}
+}
+
+func TestWriteInPlaceWhenRenameFails(t *testing.T) {
 	dir := t.TempDir()
-	target := filepath.Join(dir, "real.json")
-	if err := os.WriteFile(target, []byte(`{}`), 0o600); err != nil {
+	path := filepath.Join(dir, "config.json")
+	store := load(t, path)
+	if err := store.Update(setModel("a/one")); err != nil {
 		t.Fatal(err)
 	}
-	link := filepath.Join(dir, "config.json")
-	if err := os.Symlink(target, link); err != nil {
-		t.Skip("symlinks unavailable:", err)
-	}
-	if err := load(t, link).Update(setModel("a/one")); err != nil {
+	before, err := os.Stat(path)
+	if err != nil {
 		t.Fatal(err)
 	}
-	if info, err := os.Lstat(link); err != nil || info.Mode()&os.ModeSymlink == 0 {
-		t.Fatalf("link replaced: %v %v", info, err)
+	// As for a bind-mounted file, which rename(2) reports as busy.
+	rename = func(string, string) error { return errors.New("device or resource busy") }
+	t.Cleanup(func() { rename = os.Rename })
+	if err := store.Update(setModel("b/two")); err != nil {
+		t.Fatal(err)
 	}
-	if model := onDisk(t, target).Model; model != "a/one" {
-		t.Fatalf("target model = %q", model)
+	after, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !os.SameFile(before, after) {
+		t.Fatal("file replaced instead of written in place")
+	}
+	if model := onDisk(t, path).Model; model != "b/two" {
+		t.Fatalf("model on disk = %q", model)
+	}
+	if model := store.Get().Model; model != "b/two" {
+		t.Fatalf("model = %q", model)
+	}
+	if entries, err := os.ReadDir(dir); err != nil || len(entries) != 1 {
+		t.Fatalf("directory holds %v %v", entries, err)
 	}
 }
 
@@ -238,6 +303,9 @@ func TestTransportValidation(t *testing.T) {
 		{`{"url":"http://x"}`, "", ""},
 		{`{"url":"http://x","transport":"sse"}`, "sse", ""},
 		{`{"command":"srv","transport":"sse"}`, "", `transport "sse" needs a url`},
+		{`{"command":"srv","url":"http://x","transport":"sse"}`, "", `mcp_servers.s: set exactly one of command or url`},
+		{`{"command":"srv","url":"http://x"}`, "", `set exactly one of command or url`},
+		{`{}`, "", `set exactly one of command or url`},
 		{`{"url":"http://x","transport":"websocket"}`, "", `mcp_servers.s: unknown transport "websocket"`},
 	} {
 		path := filepath.Join(t.TempDir(), "config.json")
@@ -255,5 +323,26 @@ func TestTransportValidation(t *testing.T) {
 		case store.Get().MCPServers["s"].Transport != tc.transport:
 			t.Errorf("%s: transport = %q", tc.server, store.Get().MCPServers["s"].Transport)
 		}
+	}
+
+	// A re-read that fails validation keeps the last good config, and Update
+	// refuses to overwrite the file.
+	path := filepath.Join(t.TempDir(), "config.json")
+	if err := os.WriteFile(path, []byte(`{"mcp_servers":{"s":{"url":"http://x"}}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	store := load(t, path)
+	bad := `{"mcp_servers":{"s":{"url":"http://x","transport":"websocket"}}}`
+	if err := os.WriteFile(path, []byte(bad), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if server := store.Get().MCPServers["s"]; server.URL != "http://x" || server.Transport != "" {
+		t.Fatalf("server after invalid re-read = %+v", server)
+	}
+	if err := store.Update(setModel("b/two")); err == nil || !strings.Contains(err.Error(), "unknown transport") {
+		t.Fatalf("Update over invalid file: %v", err)
+	}
+	if data, _ := os.ReadFile(path); string(data) != bad {
+		t.Fatalf("invalid file overwritten: %s", data)
 	}
 }
