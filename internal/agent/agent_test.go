@@ -68,6 +68,7 @@ func textChunks(text string) []string {
 
 type harness struct {
 	t      *testing.T
+	agent  *Agent
 	conn   *acp.Connection
 	init   schema.InitializeResponse
 	router *fakeRouter
@@ -113,13 +114,13 @@ func startHarness(t *testing.T) *harness {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	h.store = store
+	h.store, h.agent = store, New(store, "test")
 
 	agentIn, clientOut := io.Pipe()
 	clientIn, agentOut := io.Pipe()
 	ctx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(cancel)
-	go func() { _ = Serve(ctx, New(store, "test"), agentIn, agentOut) }()
+	go func() { _ = Serve(ctx, h.agent, agentIn, agentOut) }()
 
 	handler := func(_ context.Context, method string, raw json.RawMessage) (any, error) {
 		h.mu.Lock()

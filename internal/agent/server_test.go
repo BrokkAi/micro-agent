@@ -9,11 +9,13 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"reflect"
 	"slices"
 	"strings"
 	"testing"
 
 	"github.com/BrokkAi/acp-go"
+	acpmcp "github.com/BrokkAi/acp-go/mcp"
 	schema "github.com/BrokkAi/acp-go/schema/unstable"
 	"github.com/BrokkAi/micro-agent/internal/config"
 )
@@ -106,7 +108,17 @@ func TestMethodGating(t *testing.T) {
 	}
 }
 
-func TestOffersGatesOptionalMethods(t *testing.T) {
+func TestGuardGatesOptionalMethods(t *testing.T) {
+	store, err := config.Load(filepath.Join(t.TempDir(), "config.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	a := New(store, "test")
+	var reached []string
+	guarded := a.guard(func(_ context.Context, method string, _ json.RawMessage) (any, error) {
+		reached = append(reached, method)
+		return "ok", nil
+	})
 	full := &schema.AgentCapabilities{
 		LoadSession: ptr(true),
 		Auth:        &schema.AgentAuthCapabilities{Logout: &schema.LogoutCapabilities{}},
@@ -116,17 +128,28 @@ func TestOffersGatesOptionalMethods(t *testing.T) {
 			List: &schema.SessionListCapabilities{}, Resume: &schema.SessionResumeCapabilities{},
 		},
 	}
-	for _, method := range []string{
+	optional := []string{
 		schema.SessionLoadMethodName, schema.SessionResumeMethodName, schema.SessionCloseMethodName, schema.SessionListMethodName,
 		schema.SessionDeleteMethodName, schema.SessionForkMethodName, schema.LogoutMethodName,
 		schema.ProvidersListMethodName, schema.ProvidersSetMethodName, schema.ProvidersDisableMethodName,
-	} {
-		if offers(&schema.AgentCapabilities{}, method) || !offers(full, method) {
-			t.Errorf("%s not gated on its capability", method)
+	}
+	ctx := context.Background()
+	for _, method := range optional {
+		a.offered = &schema.AgentCapabilities{}
+		if _, err := guarded(ctx, method, nil); rpcCode(err) != -32601 {
+			t.Errorf("%s not offered: %v", method, err)
+		}
+		a.offered = full
+		if _, err := guarded(ctx, method, nil); err != nil {
+			t.Errorf("%s offered: %v", method, err)
 		}
 	}
-	if !offers(&schema.AgentCapabilities{}, schema.SessionPromptMethodName) {
-		t.Error("session/prompt gated")
+	a.offered = &schema.AgentCapabilities{}
+	if result, err := guarded(ctx, schema.SessionPromptMethodName, nil); err != nil || result != "ok" {
+		t.Errorf("session/prompt = %v, %v", result, err)
+	}
+	if want := append(optional, schema.SessionPromptMethodName); !slices.Equal(reached, want) {
+		t.Errorf("reached %v, want %v", reached, want)
 	}
 }
 
@@ -163,26 +186,35 @@ func TestClientGatesUnadvertisedMethods(t *testing.T) {
 			t.Errorf("%s: %v", name, err)
 		}
 	}
-	if caps := c.Capabilities(); caps.Fs != nil || caps.Terminal != nil {
-		t.Errorf("capabilities = %+v", caps)
-	}
 }
 
 func TestConfigFormUsesTypedElicitation(t *testing.T) {
 	h := newHarness(t, schema.ClientCapabilities{Elicitation: &schema.ElicitationCapabilities{Form: &schema.ElicitationFormCapabilities{}}})
 	var params json.RawMessage
+	var content map[string]schema.ElicitationContentValue
 	h.on(schema.ElicitationCreateMethodName, func(raw json.RawMessage) (any, error) {
 		h.mu.Lock()
+		defer h.mu.Unlock()
 		params = raw
-		h.mu.Unlock()
-		return schema.CreateElicitationResponse{Accept: &schema.ElicitationAcceptAction{Content: map[string]schema.ElicitationContentValue{
-			"max_turns": 5, "default_mode": "plan",
-		}}}, nil
+		return schema.CreateElicitationResponse{Accept: &schema.ElicitationAcceptAction{Content: content}}, nil
 	})
+	reply := func(c map[string]schema.ElicitationContentValue) {
+		h.mu.Lock()
+		content = c
+		h.mu.Unlock()
+	}
 	session := h.newSession()
+	// The form offers a valid mode in place of one it cannot show.
+	if err := h.store.Update(func(c *config.Config) error { c.DefaultMode = "bogus"; return nil }); err != nil {
+		t.Fatal(err)
+	}
+	unchanged := h.store.Get()
+
+	// Accepting with nothing filled in saves nothing.
+	reply(map[string]schema.ElicitationContentValue{})
 	h.prompt(session, "/config")
-	if cfg := h.store.Get(); cfg.MaxTurns != 5 || cfg.DefaultMode != "plan" {
-		t.Fatalf("config = %+v", cfg)
+	if cfg := h.store.Get(); !reflect.DeepEqual(cfg, unchanged) {
+		t.Fatalf("empty form saved %+v", cfg)
 	}
 
 	var wire struct {
@@ -190,7 +222,8 @@ func TestConfigFormUsesTypedElicitation(t *testing.T) {
 		SessionID       schema.SessionId `json:"sessionId"`
 		RequestedSchema struct {
 			Properties map[string]struct {
-				OneOf []schema.EnumOption `json:"oneOf"`
+				Default any                 `json:"default"`
+				OneOf   []schema.EnumOption `json:"oneOf"`
 			} `json:"properties"`
 		} `json:"requestedSchema"`
 	}
@@ -200,11 +233,90 @@ func TestConfigFormUsesTypedElicitation(t *testing.T) {
 	if err != nil || wire.Mode != "form" || wire.SessionID != session || len(wire.RequestedSchema.Properties) == 0 {
 		t.Fatalf("elicitation/create = %s (%v)", params, err)
 	}
-	if !slices.ContainsFunc(wire.RequestedSchema.Properties["default_mode"].OneOf, func(o schema.EnumOption) bool { return o.Const == "plan" && o.Title == "Plan" }) {
-		t.Errorf("default_mode options = %+v", wire.RequestedSchema.Properties["default_mode"].OneOf)
+	mode := wire.RequestedSchema.Properties["default_mode"]
+	if !slices.ContainsFunc(mode.OneOf, func(o schema.EnumOption) bool { return o.Const == "plan" && o.Title == "Plan" }) {
+		t.Errorf("default_mode options = %+v", mode.OneOf)
+	}
+	if mode.Default != "default" || !slices.ContainsFunc(mode.OneOf, func(o schema.EnumOption) bool { return o.Const == mode.Default }) {
+		t.Errorf("default_mode default = %v, not one of %+v", mode.Default, mode.OneOf)
 	}
 	if efforts := wire.RequestedSchema.Properties["reasoning_effort"].OneOf; len(efforts) == 0 || efforts[0].Title != "Model default" {
 		t.Errorf("reasoning_effort options = %+v", efforts)
+	}
+
+	// Sending back the values the form showed saves nothing either.
+	shown := map[string]schema.ElicitationContentValue{}
+	for key, property := range wire.RequestedSchema.Properties {
+		if property.Default != nil {
+			shown[key] = property.Default
+		}
+	}
+	reply(shown)
+	h.prompt(session, "/config")
+	if cfg := h.store.Get(); !reflect.DeepEqual(cfg, unchanged) {
+		t.Fatalf("unchanged form saved %+v", cfg)
+	}
+
+	reply(map[string]schema.ElicitationContentValue{"max_turns": 5, "default_mode": "plan"})
+	h.prompt(session, "/config")
+	if cfg := h.store.Get(); cfg.MaxTurns != 5 || cfg.DefaultMode != "plan" {
+		t.Fatalf("config = %+v", cfg)
+	}
+}
+
+func TestResumeAnnouncesBeforeResponding(t *testing.T) {
+	h := newHarness(t, schema.ClientCapabilities{})
+	h.router.responses = [][]string{textChunks("hi")}
+	session := h.newSession()
+	h.prompt(session, "hello")
+	h.mu.Lock()
+	h.updates = nil
+	h.mu.Unlock()
+	broken := schema.McpServer{Stdio: &schema.McpServerStdio{Name: "broken", Command: filepath.Join(h.dir, "missing"), Args: []string{}, Env: []schema.EnvVariable{}}}
+	resume := schema.ResumeSessionRequest{SessionID: session, Cwd: h.dir, MCPServers: []schema.McpServer{broken}}
+	if _, err := send[schema.ResumeSessionResponse](h, schema.SessionResumeMethodName, resume); err != nil {
+		t.Fatal(err)
+	}
+	want := []schema.SessionUpdateKind{schema.SessionUpdateKindAvailableCommandsUpdate, schema.SessionUpdateKindSessionInfoUpdate, schema.SessionUpdateKindAgentMessageChunk}
+	if kinds := h.kinds(); !slices.Equal(kinds, want) {
+		t.Fatalf("updates before the response = %v, want %v", kinds, want)
+	}
+	h.mu.Lock()
+	notice := h.updates[2].Update.AgentMessageChunk.Content.Text.Text
+	h.mu.Unlock()
+	if !strings.Contains(notice, "`broken` failed to start") {
+		t.Fatalf("notice = %q", notice)
+	}
+}
+
+func TestMCPMessageNotificationsReachTheCall(t *testing.T) {
+	h := newHarness(t, schema.ClientCapabilities{})
+	h.on(schema.McpMessageMethodName, func(raw json.RawMessage) (any, error) {
+		var request schema.MessageMcpRequest
+		if err := json.Unmarshal(raw, &request); err != nil {
+			return nil, err
+		}
+		progress := schema.MessageMcpNotification{ServerID: request.ServerID, RequestID: request.RequestID, Method: "notifications/progress", Params: map[string]any{"progress": 1}}
+		if err := h.conn.Notify(context.Background(), schema.McpMessageMethodName, progress); err != nil {
+			return nil, err
+		}
+		return schema.MessageMcpResponse{Result: &schema.MessageMcpResponseResult{Result: json.RawMessage(`{"tools":[]}`)}}, nil
+	})
+	notes := make(chan acpmcp.MessageNotification, 1)
+	outcome, err := h.agent.client.messages.Call(context.Background(), "tools", "r1", "tools/list", nil, func(n acpmcp.MessageNotification) error {
+		notes <- n
+		return nil
+	})
+	if err != nil || string(outcome.Result) != `{"tools":[]}` {
+		t.Fatalf("outcome = %+v, %v", outcome, err)
+	}
+	select {
+	case n := <-notes:
+		if n.ServerID != "tools" || n.RequestID != "r1" || n.Method != "notifications/progress" {
+			t.Fatalf("notification = %+v", n)
+		}
+	default:
+		t.Fatal("notification not delivered before the call returned")
 	}
 }
 
@@ -332,6 +444,11 @@ func TestFrameReaderDropsOversizeFrames(t *testing.T) {
 	input := pad(`{"jsonrpc":"2.0","method":"note","params":"`, `"}`, maxFrame) +
 		pad(`{"jsonrpc":"2.0","id":7,"method":"session/prompt","params":"`, `"}`, maxFrame) +
 		pad(`{"jsonrpc":"2.0","id":"r1","result":"`, `"}`, maxFrame+1) +
+		// The id comes after the cut, past nested and quoted look-alikes.
+		pad(`{"jsonrpc":"2.0","result":{"id":99,"text":"\"},\"id\":98,`, `"},"id":3}`, maxFrame) +
+		pad(`[{"jsonrpc":"2.0","id":4,"method":"session/prompt","params":{"id":97,"text":"`,
+			`"}},{"jsonrpc":"2.0","method":"note"},{"jsonrpc":"2.0","result":{},"id":"r2"},["junk"],`+
+				`{"jsonrpc":"2.0","error":{"code":1,"message":"m"},"id":"r3"},{"jsonrpc":"2.0","method":"x","id":5}]`, maxFrame) +
 		fits
 	ready := make(chan struct{})
 	close(ready)
@@ -352,10 +469,11 @@ func TestFrameReaderDropsOversizeFrames(t *testing.T) {
 	dropped := func(id string) string {
 		return `{"jsonrpc":"2.0","id":` + id + `,"error":{"code":-32600,"message":"ACP frame over the 8 MiB limit dropped"}}`
 	}
-	if len(lines) != 2 || lines[0] != dropped(`"r1"`) || lines[1]+"\n" != fits {
+	want := []string{dropped(`"r1"`), dropped("3"), dropped(`"r2"`), dropped(`"r3"`)}
+	if len(lines) != 5 || !slices.Equal(lines[:4], want) || lines[4]+"\n" != fits {
 		t.Fatalf("passed %d lines, first %.120q", len(lines), lines)
 	}
-	if out.String() != dropped("7")+"\n" {
-		t.Fatalf("answered %q", out.String())
+	if want := dropped("7") + "\n[" + dropped("4") + "," + dropped("5") + "]\n"; out.String() != want {
+		t.Fatalf("answered %q, want %q", out.String(), want)
 	}
 }

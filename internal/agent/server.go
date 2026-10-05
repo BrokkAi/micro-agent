@@ -198,13 +198,6 @@ type clientConn struct {
 	messages *acpmcp.MessageClient
 }
 
-// Capabilities returns what the client advertised in initialize.
-func (c *clientConn) Capabilities() schema.ClientCapabilities {
-	c.a.mu.Lock()
-	defer c.a.mu.Unlock()
-	return c.a.caps
-}
-
 func (c *clientConn) Call(ctx context.Context, method string, params, result any) error {
 	return c.conn.Call(ctx, method, params, result)
 }
@@ -386,9 +379,10 @@ func (w *frameWriter) introduced(p []byte) []schema.SessionId {
 const maxFrame = 8 << 20
 
 // frameReader feeds inbound frames to acp.Connect and drops any over its
-// limit instead of letting it close the connection. A dropped request is answered with an error; a dropped response to one
-// of the agent's own requests is replaced by an error for it, so the waiting
-// call fails instead of hanging.
+// limit instead of letting it close the connection. Each request in a dropped
+// frame is answered with an error, and each response to one of the agent's
+// own requests is replaced by an error for it, so the waiting call fails
+// instead of hanging.
 type frameReader struct {
 	in    io.ReadCloser
 	r     *bufio.Reader
@@ -417,65 +411,159 @@ func (f *frameReader) Read(p []byte) (int, error) {
 
 func (f *frameReader) Close() error { return f.in.Close() }
 
+// next returns the next frame, or the errors standing in for one too long to
+// pass on. A long frame is scanned as it streams past rather than held.
 func (f *frameReader) next() ([]byte, error) {
 	var line []byte
+	var scan *frameScan
 	for {
 		chunk, err := f.r.ReadSlice('\n')
-		if len(line) < maxFrame {
-			line = append(line, chunk...)
+		if scan != nil {
+			scan.write(chunk)
+		} else if line = append(line, chunk...); len(bytes.TrimSuffix(line, []byte("\n"))) >= maxFrame {
+			scan = &frameScan{}
+			scan.write(line)
+			line = nil
 		}
 		if err == bufio.ErrBufferFull {
 			continue
 		}
-		if len(bytes.TrimSuffix(line, []byte("\n"))) < maxFrame {
+		if scan == nil {
 			return line, err
 		}
-		return f.oversize(line[:64<<10]), err
+		return f.oversize(scan), err
 	}
 }
 
-// oversize answers a dropped frame from its head, when that shows an id.
-func (f *frameReader) oversize(head []byte) []byte {
-	id, request, response := frameHead(head)
-	if id == nil || !request && !response {
-		return nil
+// oversize answers the requests in a dropped frame, as a batch if it was one,
+// and returns errors standing in for its responses.
+func (f *frameReader) oversize(scan *frameScan) []byte {
+	var replies []frame
+	var back []byte
+	for _, m := range scan.msgs {
+		reply := frame{JSONRPC: "2.0", ID: m.id, Error: &acp.RPCError{
+			Code:    int(schema.ErrorCodeInvalidRequest),
+			Message: fmt.Sprintf("ACP frame over the %d MiB limit dropped", maxFrame>>20),
+		}}
+		switch {
+		case m.request:
+			replies = append(replies, reply)
+		case m.response:
+			if data, err := encode(reply); err == nil {
+				back = append(back, data...)
+			}
+		}
 	}
-	reply, err := encode(frame{ID: id, Error: &acp.RPCError{
-		Code:    int(schema.ErrorCodeInvalidRequest),
-		Message: fmt.Sprintf("ACP frame over the %d MiB limit dropped", maxFrame>>20),
-	}})
-	if err != nil {
-		return nil
+	if len(replies) == 0 {
+		return back
 	}
-	if request {
-		_, _ = f.out.Write(reply)
-		return nil
+	var answer any = replies[0]
+	if scan.batch {
+		answer = replies
 	}
-	return reply
+	if data, err := json.Marshal(answer); err == nil {
+		_, _ = f.out.Write(append(data, '\n'))
+	}
+	return back
 }
 
-// frameHead reads the id of a truncated frame, and whether it is a request or
-// a response, from the members ahead of the cut.
-func frameHead(head []byte) (id json.RawMessage, request, response bool) {
-	d := json.NewDecoder(bytes.NewReader(head))
-	if t, err := d.Token(); err != nil || t != json.Delim('{') {
-		return nil, false, false
+// frameScan follows the JSON structure of a frame a byte at a time and notes
+// each message in it that has an id: the frame itself, or each entry of a
+// batch.
+type frameScan struct {
+	depth    int
+	batch    bool
+	str, esc bool   // inside a string; just after a backslash in one
+	inMsg    bool   // inside a message object
+	key      bool   // the next string among the message's members is a name
+	name     []byte // the last member name, as far as it matters
+	reading  bool   // reading the id value into id
+	id       []byte
+	msg      frameMsg
+	msgs     []frameMsg
+}
+
+// frameMsg is what a dropped frame showed of one message.
+type frameMsg struct {
+	id                json.RawMessage
+	request, response bool
+}
+
+func (s *frameScan) write(p []byte) {
+	for _, c := range p {
+		s.step(c)
 	}
-	for d.More() {
-		t, err := d.Token()
-		if err != nil {
-			break
-		}
-		key, _ := t.(string)
-		request = request || key == "method" || key == "params"
-		response = response || key == "result" || key == "error"
-		var value json.RawMessage
-		if d.Decode(&value) != nil {
-			break
-		}
-		if key == "id" && string(value) != "null" {
-			id = value
-		}
+}
+
+func (s *frameScan) step(c byte) {
+	level := 1 // the depth of a message's members
+	if s.batch {
+		level = 2
 	}
-	return id, request, response
+	member := s.inMsg && s.depth == level
+	switch {
+	case s.str:
+		switch {
+		case s.esc:
+			s.esc = false
+		case c == '\\':
+			s.esc = true
+		case c == '"':
+			s.str = false
+		}
+		if member && s.key && s.str && len(s.name) <= len("method") {
+			s.name = append(s.name, c)
+		}
+	case c == '"':
+		s.str = true
+		if member && s.key {
+			s.name = s.name[:0]
+		}
+	case c == '{' || c == '[':
+		s.batch = s.batch || s.depth == 0 && c == '['
+		s.depth++
+		if c == '{' && s.depth == level {
+			s.inMsg, s.key, s.msg = true, true, frameMsg{}
+		}
+	case c == '}' || c == ']':
+		if member {
+			s.endID()
+			if s.msg.id != nil {
+				s.msgs = append(s.msgs, s.msg)
+			}
+			s.inMsg = false
+		}
+		s.depth--
+	case member && c == ':':
+		s.key = false
+		switch string(s.name) {
+		case "method", "params":
+			s.msg.request = true
+		case "result", "error":
+			s.msg.response = true
+		case "id":
+			s.reading, s.id = true, s.id[:0]
+			return
+		}
+	case member && c == ',':
+		s.endID()
+		s.key = true
+	}
+	if s.reading && len(s.id) <= maxID {
+		s.id = append(s.id, c)
+	}
+}
+
+// maxID bounds the id kept from a dropped frame; longer ones are not answered.
+const maxID = 64
+
+// endID keeps the id just read, unless it is null, too long or not JSON.
+func (s *frameScan) endID() {
+	if !s.reading {
+		return
+	}
+	s.reading = false
+	if id := bytes.TrimSpace(s.id); len(s.id) <= maxID && json.Valid(id) && string(id) != "null" {
+		s.msg.id = bytes.Clone(id)
+	}
 }
