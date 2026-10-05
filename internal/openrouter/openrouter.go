@@ -6,11 +6,16 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"crypto/rand"
+	"crypto/sha256"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -26,15 +31,32 @@ type Message struct {
 	ToolCallID       string            `json:"tool_call_id,omitempty"`
 }
 
-// Part is a multimodal content part.
+// Part is a multimodal content part: "text", "image_url", "input_audio" or
+// "file".
 type Part struct {
-	Type     string    `json:"type"`
-	Text     string    `json:"text,omitempty"`
-	ImageURL *ImageURL `json:"image_url,omitempty"`
+	Type       string      `json:"type"`
+	Text       string      `json:"text,omitempty"`
+	ImageURL   *ImageURL   `json:"image_url,omitempty"`
+	InputAudio *InputAudio `json:"input_audio,omitempty"`
+	File       *File       `json:"file,omitempty"`
 }
 
 type ImageURL struct {
 	URL string `json:"url"`
+}
+
+// InputAudio is raw base64 audio, not a data: URL; OpenRouter does not take
+// audio URLs. Format is the codec name, such as "wav" or "mp3".
+type InputAudio struct {
+	Data   string `json:"data"`
+	Format string `json:"format"`
+}
+
+// File is a document such as a PDF. FileData is a public URL or a
+// "data:application/pdf;base64,..." URL.
+type File struct {
+	Filename string `json:"filename"`
+	FileData string `json:"file_data"`
 }
 
 type ToolCall struct {
@@ -80,16 +102,32 @@ type Reasoning struct {
 
 // Usage is the token accounting reported at the end of a stream.
 type Usage struct {
-	PromptTokens     uint64  `json:"prompt_tokens"`
-	CompletionTokens uint64  `json:"completion_tokens"`
-	TotalTokens      uint64  `json:"total_tokens"`
-	Cost             float64 `json:"cost"`
+	PromptTokens            uint64                  `json:"prompt_tokens"`
+	CompletionTokens        uint64                  `json:"completion_tokens"`
+	TotalTokens             uint64                  `json:"total_tokens"`
+	Cost                    float64                 `json:"cost"`
+	PromptTokensDetails     PromptTokensDetails     `json:"prompt_tokens_details"`
+	CompletionTokensDetails CompletionTokensDetails `json:"completion_tokens_details"`
 }
 
-// Handler receives stream deltas as they arrive.
+// PromptTokensDetails counts the prompt tokens read from and written to the
+// provider's prompt cache.
+type PromptTokensDetails struct {
+	CachedTokens     uint64 `json:"cached_tokens"`
+	CacheWriteTokens uint64 `json:"cache_write_tokens"`
+}
+
+type CompletionTokensDetails struct {
+	ReasoningTokens uint64 `json:"reasoning_tokens"`
+}
+
+// Handler receives stream deltas as they arrive. Retry, if set, is called
+// before each backoff sleep with the retry number (from 1), the wait and the
+// error being retried.
 type Handler struct {
 	Text      func(string) error
 	Reasoning func(string) error
+	Retry     func(attempt int, wait time.Duration, err error)
 }
 
 // Result is the assembled assistant turn.
@@ -99,11 +137,15 @@ type Result struct {
 	Usage        *Usage
 }
 
-// Client talks to OpenRouter.
+// Client talks to OpenRouter. Headers are sent after the defaults, so they
+// can replace the bearer API key or the attribution headers.
 type Client struct {
 	BaseURL string
 	APIKey  string
+	Headers map[string]string
 	HTTP    *http.Client
+
+	backoff time.Duration // first retry wait, doubled per attempt; one second if zero
 }
 
 type chunk struct {
@@ -154,9 +196,13 @@ func (c *Client) Stream(ctx context.Context, request Request, handler Handler) (
 	if err != nil {
 		return Result{}, err
 	}
+	backoff := c.backoff
+	if backoff == 0 {
+		backoff = time.Second
+	}
 	var response *http.Response
 	for attempt := 0; ; attempt++ {
-		response, err = c.post(ctx, body)
+		response, err = c.post(ctx, "/chat/completions", "text/event-stream", body)
 		if err == nil {
 			break
 		}
@@ -165,26 +211,45 @@ func (c *Client) Stream(ctx context.Context, request Request, handler Handler) (
 		if !retryable || attempt >= 3 || ctx.Err() != nil {
 			return Result{}, err
 		}
+		wait := backoff << attempt
+		if handler.Retry != nil {
+			handler.Retry(attempt+1, wait, err)
+		}
 		select {
 		case <-ctx.Done():
 			return Result{}, ctx.Err()
-		case <-time.After(time.Duration(1<<attempt) * time.Second):
+		case <-time.After(wait):
 		}
 	}
 	defer response.Body.Close()
 	return assemble(response.Body, handler)
 }
 
-func (c *Client) post(ctx context.Context, body []byte) (*http.Response, error) {
-	request, err := http.NewRequestWithContext(ctx, http.MethodPost, strings.TrimRight(c.BaseURL, "/")+"/chat/completions", bytes.NewReader(body))
+func (c *Client) post(ctx context.Context, path, accept string, body []byte) (*http.Response, error) {
+	request, err := http.NewRequestWithContext(ctx, http.MethodPost, c.endpoint(path), bytes.NewReader(body))
 	if err != nil {
 		return nil, err
 	}
-	request.Header.Set("Authorization", "Bearer "+c.APIKey)
 	request.Header.Set("Content-Type", "application/json")
-	request.Header.Set("Accept", "text/event-stream")
+	request.Header.Set("Accept", accept)
+	return c.do(request)
+}
+
+func (c *Client) endpoint(path string) string {
+	return strings.TrimRight(c.BaseURL, "/") + path
+}
+
+// do sends request with the default headers and then c.Headers. A non-2xx
+// response becomes a *StatusError.
+func (c *Client) do(request *http.Request) (*http.Response, error) {
+	if c.APIKey != "" {
+		request.Header.Set("Authorization", "Bearer "+c.APIKey)
+	}
 	request.Header.Set("HTTP-Referer", "https://brokk.ai")
 	request.Header.Set("X-Title", "Brokk micro-agent")
+	for name, value := range c.Headers {
+		request.Header.Set(name, value)
+	}
 	client := c.HTTP
 	if client == nil {
 		client = http.DefaultClient
@@ -341,9 +406,24 @@ func (m *detailMerger) result() []json.RawMessage {
 
 // ModelInfo is the subset of OpenRouter model metadata the agent uses.
 type ModelInfo struct {
-	ID            string `json:"id"`
-	Name          string `json:"name"`
-	ContextLength uint64 `json:"context_length"`
+	ID            string       `json:"id"`
+	Name          string       `json:"name"`
+	ContextLength uint64       `json:"context_length"`
+	Architecture  Architecture `json:"architecture"`
+}
+
+// Architecture lists the modalities a model takes as input: "text", "image",
+// "file", "audio" or "video".
+type Architecture struct {
+	InputModalities []string `json:"input_modalities"`
+}
+
+// Accepts reports whether the model takes modality as input. A model that
+// lists no modalities (another provider's catalogue) is assumed to accept it,
+// leaving the provider to reject what it can't handle.
+func (m ModelInfo) Accepts(modality string) bool {
+	inputs := m.Architecture.InputModalities
+	return len(inputs) == 0 || slices.Contains(inputs, modality)
 }
 
 var (
@@ -357,15 +437,11 @@ func (c *Client) Model(ctx context.Context, id string) (ModelInfo, bool) {
 	modelsMu.Lock()
 	defer modelsMu.Unlock()
 	if modelsCache == nil {
-		request, err := http.NewRequestWithContext(ctx, http.MethodGet, strings.TrimRight(c.BaseURL, "/")+"/models", nil)
+		request, err := http.NewRequestWithContext(ctx, http.MethodGet, c.endpoint("/models"), nil)
 		if err != nil {
 			return ModelInfo{}, false
 		}
-		client := c.HTTP
-		if client == nil {
-			client = http.DefaultClient
-		}
-		response, err := client.Do(request)
+		response, err := c.do(request)
 		if err != nil {
 			return ModelInfo{}, false
 		}
@@ -373,7 +449,7 @@ func (c *Client) Model(ctx context.Context, id string) (ModelInfo, bool) {
 		var list struct {
 			Data []ModelInfo `json:"data"`
 		}
-		if response.StatusCode != http.StatusOK || json.NewDecoder(response.Body).Decode(&list) != nil {
+		if json.NewDecoder(response.Body).Decode(&list) != nil {
 			return ModelInfo{}, false
 		}
 		modelsCache = make(map[string]ModelInfo, len(list.Data))
@@ -383,4 +459,50 @@ func (c *Client) Model(ctx context.Context, id string) (ModelInfo, bool) {
 	}
 	model, ok := modelsCache[id]
 	return model, ok
+}
+
+// NewPKCE returns a random OAuth PKCE code verifier and its S256 challenge.
+func NewPKCE() (verifier, challenge string) {
+	random := make([]byte, 32)
+	rand.Read(random) // never fails since Go 1.24
+	verifier = base64.RawURLEncoding.EncodeToString(random)
+	sum := sha256.Sum256([]byte(verifier))
+	return verifier, base64.RawURLEncoding.EncodeToString(sum[:])
+}
+
+// AuthURL is the OpenRouter page where the user approves a PKCE login. After
+// approval OpenRouter redirects to callbackURL with ?code=; http://localhost
+// is accepted on any port. An empty callbackURL selects headless mode, where
+// the page shows the code for the user to paste instead.
+func AuthURL(callbackURL, challenge string) string {
+	query := url.Values{
+		"code_challenge":        {challenge},
+		"code_challenge_method": {"S256"},
+		"key_label":             {"Brokk micro-agent"},
+	}
+	if callbackURL != "" {
+		query.Set("callback_url", callbackURL)
+	}
+	return "https://openrouter.ai/auth?" + query.Encode()
+}
+
+// ExchangeCode trades a PKCE authorization code and its verifier for an API
+// key.
+func (c *Client) ExchangeCode(ctx context.Context, code, verifier string) (string, error) {
+	body, _ := json.Marshal(map[string]string{"code": code, "code_verifier": verifier, "code_challenge_method": "S256"})
+	response, err := c.post(ctx, "/auth/keys", "application/json", body)
+	if err != nil {
+		return "", err
+	}
+	defer response.Body.Close()
+	var result struct {
+		Key string `json:"key"`
+	}
+	if err := json.NewDecoder(response.Body).Decode(&result); err != nil {
+		return "", fmt.Errorf("openrouter: bad key exchange response: %w", err)
+	}
+	if result.Key == "" {
+		return "", errors.New("openrouter: key exchange returned no key")
+	}
+	return result.Key, nil
 }
