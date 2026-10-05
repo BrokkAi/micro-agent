@@ -38,9 +38,11 @@ type session struct {
 	record
 
 	mu sync.Mutex
-	// done is closed when the running prompt turn ends; cancel aborts it.
-	done    chan struct{}
-	cancel  context.CancelFunc
+	// done is closed when the running prompt turn ends.
+	done chan struct{}
+	// cancel aborts the newest prompt, running or waiting for done. Each
+	// prompt aborts the one before it, so this stops them all.
+	cancel  *context.CancelFunc
 	servers []*mcp.Client
 	// decisions remembers allow_always/reject_always answers by permission key.
 	decisions map[string]bool
@@ -135,14 +137,19 @@ func (a *Agent) open(ctx context.Context, s *session, servers []schema.McpServer
 // shutdown cancels work and releases MCP connections.
 func (a *Agent) shutdown(s *session) {
 	s.mu.Lock()
-	if s.cancel != nil {
-		s.cancel()
-	}
+	s.stop()
 	servers := s.servers
 	s.servers = nil
 	s.mu.Unlock()
 	for _, server := range servers {
 		_ = server.Close()
+	}
+}
+
+// stop aborts the session's prompts. s.mu must be held.
+func (s *session) stop() {
+	if s.cancel != nil {
+		(*s.cancel)()
 	}
 }
 

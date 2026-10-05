@@ -173,6 +173,7 @@ func TestReadFileFetchesLargeFilesInPart(t *testing.T) {
 		toolCallChunks("call_2", "read_file", map[string]any{"path": "big.txt", "offset": 29998, "limit": 5}),
 		toolCallChunks("call_3", "read_file", map[string]any{"path": "small.txt", "limit": 10}),
 		toolCallChunks("call_4", "read_file", map[string]any{"path": "unsaved.txt"}),
+		toolCallChunks("call_5", "read_file", map[string]any{"path": "big.txt", "offset": 40000}),
 		textChunks("done"),
 	}
 	h.prompt(h.newSession(), "read them")
@@ -185,6 +186,7 @@ func TestReadFileFetchesLargeFilesInPart(t *testing.T) {
 		"     1\tsmall 1\n     2\tsmall 2\n     3\tsmall 3\n     4\tsmall 4\n     5\tsmall 5\n     6\tsmall 6\n     7\tsmall 7\n     8\tsmall 8\n     9\tsmall 9\n    10\tsmall 10\n" +
 			"[Showing lines 1-10 of 30. Use offset=11 to continue.]\n",
 		"     1\ta\n     2\tb\n",
+		"Error: offset 40000 is past the end of the file",
 	}
 	for i, w := range want {
 		if output := toolOutput(h, i+1); output != w {
@@ -197,6 +199,7 @@ func TestReadFileFetchesLargeFilesInPart(t *testing.T) {
 		{Path: bigPath, Line: line(29998), Limit: line(6)},
 		{Path: smallPath},
 		{Path: unsaved, Line: line(1), Limit: line(2001)},
+		{Path: bigPath, Line: line(40000), Limit: line(2001)},
 	}
 	h.mu.Lock()
 	defer h.mu.Unlock()

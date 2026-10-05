@@ -461,6 +461,93 @@ func TestPromptReplacesRunningTurn(t *testing.T) {
 	}
 }
 
+func TestStopReachesWaitingPrompt(t *testing.T) {
+	stops := map[string]func(*harness, schema.SessionId){
+		"cancel": func(h *harness, id schema.SessionId) {
+			_ = h.conn.Notify(context.Background(), schema.SessionCancelMethodName, schema.CancelNotification{SessionID: id})
+		},
+		"close": func(h *harness, id schema.SessionId) {
+			if _, err := send[schema.CloseSessionResponse](h, schema.SessionCloseMethodName, schema.CloseSessionRequest{SessionID: id}); err != nil {
+				h.t.Error(err)
+			}
+		},
+	}
+	for name, stop := range stops {
+		t.Run(name, func(t *testing.T) {
+			h := newHarness(t, schema.ClientCapabilities{Terminal: ptr(true)})
+			h.router.responses = [][]string{
+				toolCallChunks("call_1", "shell", map[string]string{"command": "sleep 60"}),
+				textChunks("should not run"),
+			}
+			session := h.newSession()
+			type result struct {
+				response schema.PromptResponse
+				err      error
+			}
+			second := make(chan result, 1)
+			release := make(chan struct{})
+			defer close(release)
+			onTerminal(h, func() {
+				go func() {
+					response, err := send[schema.PromptResponse](h, schema.SessionPromptMethodName, schema.PromptRequest{SessionID: session, Prompt: []schema.ContentBlock{textBlock("do this instead")}})
+					second <- result{response, err}
+				}()
+				<-release // the turn stops waiting only when cancelled
+			})
+			// The second prompt has cancelled the first, and waits while it unwinds.
+			h.on(schema.TerminalOutputMethodName, func(json.RawMessage) (any, error) {
+				stop(h, session)
+				time.Sleep(200 * time.Millisecond)
+				return schema.TerminalOutputResponse{}, nil
+			})
+			if reason := h.prompt(session, "run it").StopReason; reason != schema.StopReasonCancelled {
+				t.Fatalf("first stop reason %s", reason)
+			}
+			if r := <-second; r.err != nil || r.response.StopReason != schema.StopReasonCancelled {
+				t.Fatalf("second prompt = %+v, %v", r.response, r.err)
+			}
+			h.router.mu.Lock()
+			defer h.router.mu.Unlock()
+			if len(h.router.requests) != 1 {
+				t.Fatalf("model requests = %d, want 1", len(h.router.requests))
+			}
+		})
+	}
+}
+
+func TestBeginWaitsForRunningTurn(t *testing.T) {
+	s := &session{}
+	// This turn ignores cancellation, so it never gives the session up.
+	end, err := s.begin(context.Background(), func() {}, time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	if _, err := s.begin(ctx, cancel, 50*time.Millisecond); rpcCode(err) != int(schema.ErrorCodeInvalidRequest) {
+		t.Fatalf("after the wait: %v", err)
+	}
+	// The caller giving up ($/cancel_request) ends the wait at once.
+	ctx, cancel = context.WithCancel(context.Background())
+	time.AfterFunc(50*time.Millisecond, cancel)
+	start := time.Now()
+	if _, err := s.begin(ctx, cancel, 10*time.Second); !errors.Is(err, context.Canceled) || time.Since(start) > 5*time.Second {
+		t.Fatalf("cancelled wait: %v after %v", err, time.Since(start))
+	}
+	if s.cancel != nil {
+		t.Fatal("a prompt that gave up is still the one to cancel")
+	}
+	end()
+	end, err = s.begin(context.Background(), func() {}, time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	end()
+	if s.done != nil || s.cancel != nil {
+		t.Fatal("ended turn still holds the session")
+	}
+}
+
 type nopWriteCloser struct{ io.Writer }
 
 func (nopWriteCloser) Close() error { return nil }

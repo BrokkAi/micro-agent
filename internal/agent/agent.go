@@ -99,9 +99,7 @@ func (a *Agent) Logout(context.Context, schema.LogoutRequest) (schema.LogoutResp
 func (a *Agent) CancelSession(_ context.Context, notification schema.CancelNotification) error {
 	if s, err := a.lookup(notification.SessionID); err == nil {
 		s.mu.Lock()
-		if s.cancel != nil {
-			s.cancel()
-		}
+		s.stop()
 		s.mu.Unlock()
 	}
 	return nil

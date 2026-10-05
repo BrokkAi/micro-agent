@@ -23,8 +23,11 @@ func (a *Agent) Prompt(parent context.Context, request schema.PromptRequest) (sc
 	}
 	ctx, cancel := context.WithCancel(parent)
 	defer cancel()
-	end, err := s.begin(ctx, cancel)
+	end, err := s.begin(ctx, cancel, turnWait)
 	if err != nil {
+		if ctx.Err() != nil { // cancelled while waiting for the turn before it
+			return schema.PromptResponse{StopReason: schema.StopReasonCancelled}, nil
+		}
 		return schema.PromptResponse{}, err
 	}
 	defer end()
@@ -61,33 +64,48 @@ func (a *Agent) Prompt(parent context.Context, request schema.PromptRequest) (sc
 const turnWait = 5 * time.Second
 
 // begin starts a turn, aborted by cancel, as the session's running turn and
-// returns the func that ends it. A turn still running, or still unwinding
-// after session/cancel, is cancelled and given turnWait to finish first, so a
-// client can cancel and prompt again straight away.
-func (s *session) begin(ctx context.Context, cancel context.CancelFunc) (func(), error) {
-	timeout := time.NewTimer(turnWait)
+// returns the func that ends it. It cancels the prompt before it; a turn still
+// running, or still unwinding after session/cancel, is given wait to finish,
+// so a client can cancel and prompt again straight away. While it waits, this
+// prompt is the one session/cancel and close abort.
+func (s *session) begin(ctx context.Context, cancel context.CancelFunc, wait time.Duration) (func(), error) {
+	mine := &cancel // tells this prompt apart from a newer one
+	s.mu.Lock()
+	s.stop()
+	s.cancel = mine
+	s.mu.Unlock()
+	leave := func() {
+		s.mu.Lock()
+		if s.cancel == mine {
+			s.cancel = nil
+		}
+		s.mu.Unlock()
+	}
+	timeout := time.NewTimer(wait)
 	defer timeout.Stop()
 	for {
 		s.mu.Lock()
 		running := s.done
-		if running == nil {
+		if running == nil && ctx.Err() == nil {
 			done := make(chan struct{})
-			s.done, s.cancel = done, cancel
+			s.done = done
 			s.mu.Unlock()
 			return func() {
 				s.mu.Lock()
-				s.done, s.cancel = nil, nil
+				s.done = nil
 				s.mu.Unlock()
+				leave()
 				close(done)
 			}, nil
 		}
-		s.cancel()
 		s.mu.Unlock()
 		select {
-		case <-running:
+		case <-running: // nil, so never ready, once ctx is done
 		case <-ctx.Done():
+			leave()
 			return nil, ctx.Err()
 		case <-timeout.C:
+			leave()
 			return nil, &acp.RPCError{Code: int(schema.ErrorCodeInvalidRequest), Message: "a prompt is already running in this session"}
 		}
 	}
