@@ -223,6 +223,26 @@ func TestModelInputModalities(t *testing.T) {
 	}
 }
 
+func TestModelFailedFetchIsNotCached(t *testing.T) {
+	calls := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		w.WriteHeader(http.StatusInternalServerError)
+	}))
+	defer server.Close()
+	resetModels(t)
+
+	client := &Client{BaseURL: server.URL}
+	for range 2 {
+		if _, ok := client.Model(context.Background(), "m"); ok {
+			t.Fatal("want ok=false for a failed /models fetch")
+		}
+	}
+	if calls != 2 || modelsCache != nil {
+		t.Fatalf("calls = %d, cache = %v", calls, modelsCache)
+	}
+}
+
 func TestPKCE(t *testing.T) {
 	verifier, challenge := NewPKCE()
 	if len(verifier) != 43 {
@@ -243,7 +263,8 @@ func TestPKCE(t *testing.T) {
 	query := parsed.Query()
 	if parsed.Scheme+"://"+parsed.Host+parsed.Path != "https://openrouter.ai/auth" ||
 		query.Get("callback_url") != "http://localhost:51423/callback" ||
-		query.Get("code_challenge") != challenge || query.Get("code_challenge_method") != "S256" {
+		query.Get("code_challenge") != challenge || query.Get("code_challenge_method") != "S256" ||
+		query.Get("key_label") != "Brokk micro-agent" {
 		t.Fatalf("auth url = %s", parsed)
 	}
 	headless, _ := url.Parse(AuthURL("", challenge))
