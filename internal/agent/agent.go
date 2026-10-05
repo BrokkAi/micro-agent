@@ -93,10 +93,7 @@ func (a *Agent) Authenticate(_ context.Context, request schema.AuthenticateReque
 }
 
 func (a *Agent) Logout(context.Context, schema.LogoutRequest) (schema.LogoutResponse, error) {
-	return schema.LogoutResponse{}, a.cfg.Update(func(c *config.Config) error {
-		c.APIKey = ""
-		return nil
-	})
+	return schema.LogoutResponse{}, a.cfg.Logout()
 }
 
 func (a *Agent) CancelSession(_ context.Context, notification schema.CancelNotification) error {
@@ -205,12 +202,9 @@ func (a *Agent) configOptions(s *session) []schema.SessionConfigOption {
 	cfg := a.cfg.Get()
 	cfg.Model = model
 
-	var modeOptions, modelOptions, effortOptions []schema.SessionConfigSelectOption
+	var modeOptions, effortOptions []schema.SessionConfigSelectOption
 	for _, m := range modes {
 		modeOptions = append(modeOptions, schema.SessionConfigSelectOption{Value: schema.SessionConfigValueId(m.id), Name: m.name, Description: ptr(m.description)})
-	}
-	for _, choice := range config.ModelChoices(cfg) {
-		modelOptions = append(modelOptions, schema.SessionConfigSelectOption{Value: schema.SessionConfigValueId(choice), Name: choice})
 	}
 	effortOptions = append(effortOptions, schema.SessionConfigSelectOption{Value: defaultEffort, Name: "Model default"})
 	for _, level := range config.Efforts {
@@ -224,10 +218,36 @@ func (a *Agent) configOptions(s *session) []schema.SessionConfigOption {
 		{ID: "mode", Name: "Mode", Category: category(schema.SessionConfigOptionCategoryMode),
 			Select: &schema.SessionConfigSelect{CurrentValue: schema.SessionConfigValueId(current), Options: modeOptions}},
 		{ID: "model", Name: "Model", Category: category(schema.SessionConfigOptionCategoryModel),
-			Select: &schema.SessionConfigSelect{CurrentValue: schema.SessionConfigValueId(model), Options: modelOptions}},
+			Select: &schema.SessionConfigSelect{CurrentValue: schema.SessionConfigValueId(model), Options: modelOptions(config.ModelChoices(cfg))}},
 		{ID: "reasoning_effort", Name: "Reasoning effort", Category: category(schema.SessionConfigOptionCategoryThoughtLevel),
 			Select: &schema.SessionConfigSelect{CurrentValue: schema.SessionConfigValueId(effort), Options: effortOptions}},
 	}
+}
+
+// modelOptions groups model slugs by vendor, the part before '/', once there
+// is more than one vendor to tell apart.
+func modelOptions(choices []string) schema.SessionConfigSelectOptions {
+	var flat []schema.SessionConfigSelectOption
+	var groups []schema.SessionConfigSelectGroup
+	index := map[string]int{}
+	for _, choice := range choices {
+		option := schema.SessionConfigSelectOption{Value: schema.SessionConfigValueId(choice), Name: choice}
+		flat = append(flat, option)
+		vendor, _, ok := strings.Cut(choice, "/")
+		if !ok {
+			vendor = "other"
+		}
+		i, seen := index[vendor]
+		if !seen {
+			i, index[vendor] = len(groups), len(groups)
+			groups = append(groups, schema.SessionConfigSelectGroup{Group: schema.SessionConfigGroupId(vendor), Name: vendor})
+		}
+		groups[i].Options = append(groups[i].Options, option)
+	}
+	if len(groups) < 2 {
+		return flat
+	}
+	return groups
 }
 
 func (a *Agent) SetConfigOption(ctx context.Context, request schema.SetSessionConfigOptionRequest) (schema.SetSessionConfigOptionResponse, error) {

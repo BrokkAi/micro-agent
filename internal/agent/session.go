@@ -37,9 +37,9 @@ type record struct {
 type session struct {
 	record
 
-	// running serializes prompt turns; cancel aborts the active one.
-	running sync.Mutex
-	mu      sync.Mutex
+	mu sync.Mutex
+	// done is closed when the running prompt turn ends; cancel aborts it.
+	done    chan struct{}
 	cancel  context.CancelFunc
 	servers []*mcp.Client
 	// decisions remembers allow_always/reject_always answers by permission key.
@@ -147,8 +147,8 @@ func (a *Agent) shutdown(s *session) {
 }
 
 func (a *Agent) NewSession(ctx context.Context, request schema.NewSessionRequest) (schema.NewSessionResponse, error) {
-	if !filepath.IsAbs(request.Cwd) {
-		return schema.NewSessionResponse{}, invalidParams("cwd must be an absolute path")
+	if err := checkRoots(request.Cwd, request.AdditionalDirectories); err != nil {
+		return schema.NewSessionResponse{}, err
 	}
 	cfg := a.cfg.Get()
 	s := &session{record: record{
@@ -190,19 +190,33 @@ func (a *Agent) ResumeSession(ctx context.Context, request schema.ResumeSessionR
 }
 
 func (a *Agent) restore(ctx context.Context, id schema.SessionId, cwd string, dirs []string, servers []schema.McpServer) (*session, []schema.SessionUpdate, error) {
+	if err := checkRoots(cwd, dirs); err != nil {
+		return nil, nil, err
+	}
 	r, err := a.loadRecord(id)
 	if err != nil {
 		return nil, nil, err
 	}
-	if cwd != "" {
-		r.Cwd = cwd
-	}
-	if dirs != nil {
-		r.Dirs = dirs
-	}
+	// The request sets the roots: no additional directories means none, not
+	// the ones saved last time.
+	r.Cwd, r.Dirs = cwd, dirs
 	r.Mode = validMode(r.Mode)
 	s := &session{record: r}
 	return s, a.open(ctx, s, servers), nil
+}
+
+// checkRoots rejects a session cwd or additional directory that is not an
+// absolute path.
+func checkRoots(cwd string, dirs []string) error {
+	if !filepath.IsAbs(cwd) {
+		return invalidParams("cwd must be an absolute path")
+	}
+	for _, dir := range dirs {
+		if !filepath.IsAbs(dir) {
+			return invalidParams(fmt.Sprintf("additional directory %q must be an absolute path", dir))
+		}
+	}
+	return nil
 }
 
 func (a *Agent) CloseSession(_ context.Context, request schema.CloseSessionRequest) (schema.CloseSessionResponse, error) {
@@ -316,9 +330,11 @@ func (a *Agent) replay(ctx context.Context, s *session) {
 			for _, call := range m.ToolCalls {
 				status := schema.ToolCallStatusCompleted
 				var content []schema.ToolCallContent
+				var output json.RawMessage
 				if result, ok := results[call.ID]; ok {
 					if text, _ := result.Content.(string); text != "" {
 						content = []schema.ToolCallContent{textContent(fence(text))}
+						output, _ = json.Marshal(text)
 					}
 				} else {
 					status = schema.ToolCallStatusFailed
@@ -326,10 +342,12 @@ func (a *Agent) replay(ctx context.Context, s *session) {
 				title, kind := describeCall(call.Function.Name, json.RawMessage(call.Function.Arguments))
 				send(schema.SessionUpdate{ToolCall: &schema.ToolCall{
 					ToolCallID: schema.ToolCallId(call.ID),
+					Name:       ptr(call.Function.Name),
 					Title:      title,
 					Kind:       &kind,
 					Status:     &status,
 					RawInput:   rawJSON(call.Function.Arguments),
+					RawOutput:  output,
 					Content:    content,
 				}})
 			}

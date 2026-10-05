@@ -10,6 +10,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -303,9 +304,9 @@ func TestRejectedPermissionDoesNotWrite(t *testing.T) {
 func TestSlashConfigUpdatesFile(t *testing.T) {
 	h := newHarness(t, schema.ClientCapabilities{})
 	session := h.newSession()
-	h.prompt(session, "/config max_turns=7 reasoning_effort=high")
+	h.prompt(session, "/config max_turns=7 reasoning_effort=high auto_compact=false")
 	cfg := h.store.Get()
-	if cfg.MaxTurns != 7 || cfg.ReasoningEffort != "high" {
+	if cfg.MaxTurns != 7 || cfg.ReasoningEffort != "high" || cfg.AutoCompactEnabled() {
 		t.Fatalf("config = %+v", cfg)
 	}
 	if len(h.router.requests) != 0 {
@@ -318,24 +319,27 @@ func TestApplyEdit(t *testing.T) {
 		text string
 		args editArgs
 		want string
+		line int
 		err  string
 	}{
-		{"a b a", editArgs{OldString: "b", NewString: "c"}, "a c a", ""},
-		{"a b a", editArgs{OldString: "a", NewString: "c"}, "", "matches 2 times"},
-		{"a b a", editArgs{OldString: "a", NewString: "c", ReplaceAll: true}, "c b c", ""},
-		{"x\r\ny\r\n", editArgs{OldString: "x\ny", NewString: "x\nz"}, "x\r\nz\r\n", ""},
-		{"abc", editArgs{OldString: "q", NewString: "r"}, "", "not found"},
+		{"a b a", editArgs{OldString: "b", NewString: "c"}, "a c a", 1, ""},
+		{"a b a", editArgs{OldString: "a", NewString: "c"}, "", 0, "matches 2 times"},
+		{"a b a", editArgs{OldString: "a", NewString: "c", ReplaceAll: true}, "c b c", 1, ""},
+		{"p\nq a\na", editArgs{OldString: "a", NewString: "c", ReplaceAll: true}, "p\nq c\nc", 2, ""},
+		{"x\r\ny\r\n", editArgs{OldString: "x\ny", NewString: "x\nz"}, "x\r\nz\r\n", 1, ""},
+		{"w\r\nx\r\ny\r\n", editArgs{OldString: "x\ny", NewString: "z"}, "w\r\nz\r\n", 2, ""},
+		{"abc", editArgs{OldString: "q", NewString: "r"}, "", 0, "not found"},
 	}
 	for _, c := range cases {
-		got, err := applyEdit(c.text, c.args)
+		got, line, err := applyEdit(c.text, c.args)
 		if c.err != "" {
 			if err == nil || !strings.Contains(err.Error(), c.err) {
 				t.Errorf("applyEdit(%q, %+v) error = %v, want %q", c.text, c.args, err, c.err)
 			}
 			continue
 		}
-		if err != nil || got != c.want {
-			t.Errorf("applyEdit(%q, %+v) = %q, %v; want %q", c.text, c.args, got, err, c.want)
+		if err != nil || got != c.want || line != c.line {
+			t.Errorf("applyEdit(%q, %+v) = %q, %d, %v; want %q, %d", c.text, c.args, got, line, err, c.want, c.line)
 		}
 	}
 }
@@ -414,5 +418,130 @@ func TestConfigKeepsSessionModel(t *testing.T) {
 	h.prompt(session, "hello")
 	if model := h.router.requests[0]["model"]; model != "other/model" {
 		t.Fatalf("model = %v", model)
+	}
+}
+
+func TestLogoutOverridesEnvKey(t *testing.T) {
+	t.Setenv("OPENROUTER_API_KEY", "env-key")
+	h := newHarness(t, schema.ClientCapabilities{})
+	if _, err := send[schema.LogoutResponse](h, schema.LogoutMethodName, schema.LogoutRequest{}); err != nil {
+		t.Fatal(err)
+	}
+	if key := h.store.Get().APIKey; key != "" {
+		t.Fatalf("key after logout = %q", key)
+	}
+	h.prompt(h.newSession(), "/login new-key")
+	if key := h.store.Get().APIKey; key != "new-key" {
+		t.Fatalf("key after login = %q", key)
+	}
+	// Logging in again turns the environment fallback back on.
+	if err := h.store.Update(func(c *config.Config) error { c.APIKey = ""; return nil }); err != nil {
+		t.Fatal(err)
+	}
+	if key := h.store.Get().APIKey; key != "env-key" {
+		t.Fatalf("key from the environment = %q", key)
+	}
+}
+
+func TestSessionRootsMustBeAbsolute(t *testing.T) {
+	h := newHarness(t, schema.ClientCapabilities{})
+	extra := t.TempDir()
+	created, err := send[schema.NewSessionResponse](h, schema.SessionNewMethodName, schema.NewSessionRequest{Cwd: h.dir, AdditionalDirectories: []string{extra}, MCPServers: []schema.McpServer{}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	id := created.SessionID
+	none := []schema.McpServer{}
+	requests := map[string]struct {
+		method string
+		params any
+	}{
+		"new cwd":    {schema.SessionNewMethodName, schema.NewSessionRequest{Cwd: "rel", MCPServers: none}},
+		"new dir":    {schema.SessionNewMethodName, schema.NewSessionRequest{Cwd: h.dir, AdditionalDirectories: []string{"rel"}, MCPServers: none}},
+		"load cwd":   {schema.SessionLoadMethodName, schema.LoadSessionRequest{SessionID: id, Cwd: "rel", MCPServers: none}},
+		"load dir":   {schema.SessionLoadMethodName, schema.LoadSessionRequest{SessionID: id, Cwd: h.dir, AdditionalDirectories: []string{"rel"}, MCPServers: none}},
+		"resume cwd": {schema.SessionResumeMethodName, schema.ResumeSessionRequest{SessionID: id, MCPServers: none}},
+		"resume dir": {schema.SessionResumeMethodName, schema.ResumeSessionRequest{SessionID: id, Cwd: h.dir, AdditionalDirectories: []string{"rel"}, MCPServers: none}},
+	}
+	for name, r := range requests {
+		if _, err := send[json.RawMessage](h, r.method, r.params); rpcCode(err) != -32602 {
+			t.Errorf("%s: %v", name, err)
+		}
+	}
+
+	dirs := func() []string {
+		s, err := h.agent.lookup(id)
+		if err != nil {
+			t.Fatal(err)
+		}
+		s.mu.Lock()
+		defer s.mu.Unlock()
+		return s.Dirs
+	}
+	h.router.responses = [][]string{textChunks("hi")}
+	h.prompt(id, "hello") // saves the session with its directory
+	resume := schema.ResumeSessionRequest{SessionID: id, Cwd: h.dir, AdditionalDirectories: []string{extra}, MCPServers: none}
+	if _, err := send[schema.ResumeSessionResponse](h, schema.SessionResumeMethodName, resume); err != nil || !slices.Equal(dirs(), []string{extra}) {
+		t.Fatalf("resume with a directory: %v, dirs %v", err, dirs())
+	}
+	// Omitted additional directories mean none, not the saved ones.
+	load := schema.LoadSessionRequest{SessionID: id, Cwd: h.dir, MCPServers: none}
+	if _, err := send[schema.LoadSessionResponse](h, schema.SessionLoadMethodName, load); err != nil || len(dirs()) != 0 {
+		t.Fatalf("load without directories: %v, dirs %v", err, dirs())
+	}
+}
+
+func TestModelOptionsGroupByVendor(t *testing.T) {
+	if options, ok := modelOptions([]string{"a/x", "a/y"}).([]schema.SessionConfigSelectOption); !ok || len(options) != 2 {
+		t.Fatalf("one vendor = %+v", options)
+	}
+	h := newHarness(t, schema.ClientCapabilities{})
+	if err := h.store.Update(func(c *config.Config) error {
+		c.Models = []string{"openai/gpt-5", "anthropic/claude", "plain", "test/other"}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	// model returns the model option's value and its groups, as
+	// "group(name):value,... ...".
+	model := func(options []schema.SessionConfigOption) (string, string) {
+		t.Helper()
+		for _, option := range options {
+			if option.ID != "model" {
+				continue
+			}
+			data, _ := json.Marshal(option.Select.Options)
+			var groups []schema.SessionConfigSelectGroup
+			if err := json.Unmarshal(data, &groups); err != nil {
+				t.Fatalf("model options %s: %v", data, err)
+			}
+			var parts []string
+			for _, g := range groups {
+				var values []string
+				for _, o := range g.Options {
+					values = append(values, string(o.Value))
+				}
+				parts = append(parts, fmt.Sprintf("%s(%s):%s", g.Group, g.Name, strings.Join(values, ",")))
+			}
+			return string(option.Select.CurrentValue), strings.Join(parts, " ")
+		}
+		t.Fatal("no model option")
+		return "", ""
+	}
+	created, err := send[schema.NewSessionResponse](h, schema.SessionNewMethodName, schema.NewSessionRequest{Cwd: h.dir, MCPServers: []schema.McpServer{}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	current, groups := model(created.ConfigOptions)
+	if want := "test(test):test/model,test/other anthropic(anthropic):anthropic/claude openai(openai):openai/gpt-5 other(other):plain"; current != "test/model" || groups != want {
+		t.Fatalf("model %s in %s, want %s", current, groups, want)
+	}
+	set := schema.SetSessionConfigOptionRequest{SessionID: created.SessionID, ConfigID: "model", ValueID: &schema.SetSessionConfigOptionRequestValueID{Value: "new/model"}}
+	response, err := send[schema.SetSessionConfigOptionResponse](h, schema.SessionSetConfigOptionMethodName, set)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if current, groups = model(response.ConfigOptions); current != "new/model" || !strings.HasPrefix(groups, "new(new):new/model ") {
+		t.Fatalf("after set: model %s in %s", current, groups)
 	}
 }

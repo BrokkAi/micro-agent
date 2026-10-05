@@ -68,7 +68,7 @@ func login(store *config.Store) error {
 		}
 		return fmt.Errorf("no key entered")
 	}
-	if err := store.Update(func(c *config.Config) error { c.APIKey = key; return nil }); err != nil {
+	if err := store.SetAPIKey(key); err != nil {
 		return err
 	}
 	fmt.Println("Saved to", store.Path())

@@ -21,20 +21,13 @@ func (a *Agent) Prompt(parent context.Context, request schema.PromptRequest) (sc
 	if err != nil {
 		return schema.PromptResponse{}, err
 	}
-	if !s.running.TryLock() {
-		return schema.PromptResponse{}, &acp.RPCError{Code: int(schema.ErrorCodeInvalidRequest), Message: "a prompt is already running in this session"}
-	}
-	defer s.running.Unlock()
 	ctx, cancel := context.WithCancel(parent)
 	defer cancel()
-	s.mu.Lock()
-	s.cancel = cancel
-	s.mu.Unlock()
-	defer func() {
-		s.mu.Lock()
-		s.cancel = nil
-		s.mu.Unlock()
-	}()
+	end, err := s.begin(ctx, cancel)
+	if err != nil {
+		return schema.PromptResponse{}, err
+	}
+	defer end()
 
 	updates := updater{a: a, id: s.ID}
 	t := &turn{a: a, s: s, client: a.client, updates: updates}
@@ -62,6 +55,42 @@ func (a *Agent) Prompt(parent context.Context, request schema.PromptRequest) (sc
 	}
 	defer a.save(s)
 	return t.loop(ctx)
+}
+
+// turnWait bounds how long a prompt waits for the turn it cancels.
+const turnWait = 5 * time.Second
+
+// begin starts a turn, aborted by cancel, as the session's running turn and
+// returns the func that ends it. A turn still running, or still unwinding
+// after session/cancel, is cancelled and given turnWait to finish first, so a
+// client can cancel and prompt again straight away.
+func (s *session) begin(ctx context.Context, cancel context.CancelFunc) (func(), error) {
+	timeout := time.NewTimer(turnWait)
+	defer timeout.Stop()
+	for {
+		s.mu.Lock()
+		running := s.done
+		if running == nil {
+			done := make(chan struct{})
+			s.done, s.cancel = done, cancel
+			s.mu.Unlock()
+			return func() {
+				s.mu.Lock()
+				s.done, s.cancel = nil, nil
+				s.mu.Unlock()
+				close(done)
+			}, nil
+		}
+		s.cancel()
+		s.mu.Unlock()
+		select {
+		case <-running:
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-timeout.C:
+			return nil, &acp.RPCError{Code: int(schema.ErrorCodeInvalidRequest), Message: "a prompt is already running in this session"}
+		}
+	}
 }
 
 func (t *turn) loop(ctx context.Context) (schema.PromptResponse, error) {
@@ -167,15 +196,16 @@ func (t *turn) call(ctx context.Context, call openrouter.ToolCall) {
 		if r.failed {
 			status = schema.ToolCallStatusFailed
 		}
-		update := &schema.ToolCallUpdate{ToolCallID: id, Status: &status, Content: r.content}
-		if r.content == nil && r.output != "" {
-			update.Content = []schema.ToolCallContent{textContent(fence(r.output))}
-		}
-		_ = t.updates.Update(schema.SessionUpdate{ToolCallUpdate: update})
 		output := r.output
 		if output == "" {
 			output = "(no output)"
 		}
+		update := &schema.ToolCallUpdate{ToolCallID: id, Status: &status, Content: r.content}
+		update.RawOutput, _ = json.Marshal(output)
+		if r.content == nil && r.output != "" {
+			update.Content = []schema.ToolCallContent{textContent(fence(r.output))}
+		}
+		_ = t.updates.Update(schema.SessionUpdate{ToolCallUpdate: update})
 		t.append(openrouter.Message{Role: "tool", ToolCallID: call.ID, Content: output})
 	}
 
@@ -183,13 +213,14 @@ func (t *turn) call(ctx context.Context, call openrouter.ToolCall) {
 	if failed != nil {
 		title, kind := describeCall(call.Function.Name, raw)
 		_ = t.updates.Update(schema.SessionUpdate{ToolCall: &schema.ToolCall{
-			ToolCallID: id, Title: title, Kind: &kind, Status: ptr(schema.ToolCallStatusPending), RawInput: raw,
+			ToolCallID: id, Name: &call.Function.Name, Title: title, Kind: &kind, Status: ptr(schema.ToolCallStatusPending), RawInput: raw,
 		}})
 		respond(*failed)
 		return
 	}
 	_ = t.updates.Update(schema.SessionUpdate{ToolCall: &schema.ToolCall{
 		ToolCallID: id,
+		Name:       &call.Function.Name,
 		Title:      act.title,
 		Kind:       &act.kind,
 		Status:     ptr(schema.ToolCallStatusPending),
@@ -198,7 +229,7 @@ func (t *turn) call(ctx context.Context, call openrouter.ToolCall) {
 		RawInput:   raw,
 	}})
 
-	allowed, err := t.permit(ctx, id, act, raw)
+	allowed, err := t.permit(ctx, id, call.Function.Name, act, raw)
 	if err != nil {
 		respond(failure("permission request failed: %v", err))
 		return
@@ -216,7 +247,7 @@ func (t *turn) call(ctx context.Context, call openrouter.ToolCall) {
 }
 
 // permit decides whether act may run, asking the client when the mode requires it.
-func (t *turn) permit(ctx context.Context, id schema.ToolCallId, act *action, raw json.RawMessage) (bool, error) {
+func (t *turn) permit(ctx context.Context, id schema.ToolCallId, name string, act *action, raw json.RawMessage) (bool, error) {
 	t.s.mu.Lock()
 	mode := t.s.Mode
 	decision, decided := t.s.decisions[act.permissionKey]
@@ -232,7 +263,7 @@ func (t *turn) permit(ctx context.Context, id schema.ToolCallId, act *action, ra
 	response, err := t.client.RequestPermission(ctx, schema.RequestPermissionRequest{
 		SessionID: t.s.ID,
 		ToolCall: schema.ToolCallUpdate{
-			ToolCallID: id, Title: &act.title, Kind: &act.kind, Status: ptr(schema.ToolCallStatusPending),
+			ToolCallID: id, Name: &name, Title: &act.title, Kind: &act.kind, Status: ptr(schema.ToolCallStatusPending),
 			Content: act.preview, Locations: act.locations, RawInput: raw,
 		},
 		Options: []schema.PermissionOption{

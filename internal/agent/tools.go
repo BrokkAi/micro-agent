@@ -6,9 +6,12 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"maps"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
+	"slices"
 	"strings"
 	"time"
 
@@ -263,12 +266,12 @@ func (t *turn) prepare(ctx context.Context, name string, raw json.RawMessage) (*
 			r := failure("%v", err)
 			return nil, &r
 		}
-		updated, err := applyEdit(old, args)
+		updated, line, err := applyEdit(old, args)
 		if err != nil {
 			r := failure("%s: %v", t.display(path), err)
 			return nil, &r
 		}
-		return t.writeAction("Edit "+t.display(path), path, &old, updated), nil
+		return t.writeAction("Edit "+t.display(path), path, uint32(line), &old, updated), nil
 	case "write_file":
 		if t.mode() == "plan" {
 			r := failure("file writes are disabled in plan mode")
@@ -288,7 +291,7 @@ func (t *turn) prepare(ctx context.Context, name string, raw json.RawMessage) (*
 			}
 			old = &text
 		}
-		return t.writeAction("Write "+t.display(path), path, old, args.Content), nil
+		return t.writeAction("Write "+t.display(path), path, 1, old, args.Content), nil
 	}
 	if binding, ok := t.mcp[name]; ok {
 		return t.mcpAction(binding, raw), nil
@@ -297,17 +300,29 @@ func (t *turn) prepare(ctx context.Context, name string, raw json.RawMessage) (*
 	return nil, &r
 }
 
-func (t *turn) writeAction(title, path string, old *string, updated string) *action {
+// writeAction replaces the file at path, whose change starts on line.
+func (t *turn) writeAction(title, path string, line uint32, old *string, updated string) *action {
+	before := ""
+	if old != nil {
+		before = *old
+	}
+	// The diff goes out up to three times (tool call, permission, result).
 	diff := schema.ToolCallContent{Diff: &schema.Diff{Path: path, OldText: old, NewText: updated}}
+	if len(before)+len(updated) >= maxFsBytes {
+		diff = textContent(fmt.Sprintf("%s: %s → %s, too large to show as a diff", path, byteSize(len(before)), byteSize(len(updated))))
+	}
+	// Content too large for fs/write_text_file goes to disk, as does a large
+	// file, which readText took from disk.
+	local := max(len(before), len(updated)) > maxFsBytes
 	return &action{
 		title:         title,
 		kind:          schema.ToolKindEdit,
-		locations:     []schema.ToolCallLocation{{Path: path}},
+		locations:     []schema.ToolCallLocation{{Path: path, Line: &line}},
 		preview:       []schema.ToolCallContent{diff},
 		permission:    permEdit,
 		permissionKey: "edit",
 		run: func(ctx context.Context) toolResult {
-			if err := t.writeText(ctx, path, updated); err != nil {
+			if err := t.writeText(ctx, path, updated, local); err != nil {
 				return failure("%v", err)
 			}
 			verb := "Updated"
@@ -319,12 +334,13 @@ func (t *turn) writeAction(title, path string, old *string, updated string) *act
 	}
 }
 
-func applyEdit(text string, args editArgs) (string, error) {
+// applyEdit returns text with the edit made, and the line of the first match.
+func applyEdit(text string, args editArgs) (string, int, error) {
 	if args.OldString == "" {
-		return "", errors.New("old_string must not be empty; use write_file to create files")
+		return "", 0, errors.New("old_string must not be empty; use write_file to create files")
 	}
 	if args.OldString == args.NewString {
-		return "", errors.New("old_string and new_string are identical")
+		return "", 0, errors.New("old_string and new_string are identical")
 	}
 	count := strings.Count(text, args.OldString)
 	if count == 0 && strings.Contains(text, "\r\n") && !strings.Contains(args.OldString, "\r\n") {
@@ -335,14 +351,15 @@ func applyEdit(text string, args editArgs) (string, error) {
 	}
 	switch {
 	case count == 0:
-		return "", errors.New("old_string not found")
+		return "", 0, errors.New("old_string not found")
 	case count > 1 && !args.ReplaceAll:
-		return "", fmt.Errorf("old_string matches %d times; add surrounding context to make it unique or set replace_all", count)
+		return "", 0, fmt.Errorf("old_string matches %d times; add surrounding context to make it unique or set replace_all", count)
 	}
+	line := strings.Count(text[:strings.Index(text, args.OldString)], "\n") + 1
 	if args.ReplaceAll {
-		return strings.ReplaceAll(text, args.OldString, args.NewString), nil
+		return strings.ReplaceAll(text, args.OldString, args.NewString), line, nil
 	}
-	return strings.Replace(text, args.OldString, args.NewString, 1), nil
+	return strings.Replace(text, args.OldString, args.NewString, 1), line, nil
 }
 
 func (t *turn) resolve(path string) string {
@@ -364,10 +381,25 @@ func (t *turn) display(path string) string {
 	return path
 }
 
+// maxFsBytes bounds file content sent over ACP in one piece, through
+// fs/*_text_file or as a diff. JSON escaping can more than double it on the
+// wire, so it stays well under the 8 MiB frame limit.
+const maxFsBytes = 1 << 20
+
+// diskSize is the size of the file at path, or -1 when it is not on disk.
+func diskSize(path string) int64 {
+	info, err := os.Stat(path)
+	if err != nil {
+		return -1
+	}
+	return info.Size()
+}
+
 // readText reads through the client when it offers fs access, so unsaved
-// editor buffers are visible, and from disk otherwise.
+// editor buffers are visible, and from disk otherwise or when the file is
+// over maxFsBytes.
 func (t *turn) readText(ctx context.Context, path string) (string, error) {
-	if t.a.canRead() {
+	if t.a.canRead() && diskSize(path) <= maxFsBytes {
 		response, err := t.client.ReadTextFile(ctx, schema.ReadTextFileRequest{SessionID: t.s.ID, Path: path})
 		if err != nil {
 			return "", fmt.Errorf("read %s: %w", path, err)
@@ -381,8 +413,10 @@ func (t *turn) readText(ctx context.Context, path string) (string, error) {
 	return string(data), nil
 }
 
-func (t *turn) writeText(ctx context.Context, path, content string) error {
-	if t.a.canWrite() {
+// writeText writes through the client when it offers fs access, unless local
+// asks for the disk.
+func (t *turn) writeText(ctx context.Context, path, content string, local bool) error {
+	if t.a.canWrite() && !local {
 		_, err := t.client.WriteTextFile(ctx, schema.WriteTextFileRequest{SessionID: t.s.ID, Path: path, Content: content})
 		return err
 	}
@@ -393,42 +427,81 @@ func (t *turn) writeText(ctx context.Context, path, content string) error {
 }
 
 func (t *turn) read(ctx context.Context, path string, args readArgs) toolResult {
-	text, err := t.readText(ctx, path)
-	if err != nil {
-		return failure("%v", err)
-	}
-	lines := strings.Split(strings.ReplaceAll(text, "\r\n", "\n"), "\n")
-	if len(lines) > 0 && lines[len(lines)-1] == "" {
-		lines = lines[:len(lines)-1]
-	}
-	if len(lines) == 0 {
-		return toolResult{output: "[empty file]\n"}
-	}
 	start := max(args.Offset, 1) - 1
-	if start >= len(lines) {
-		return failure("offset %d is past the end of the file (%d lines)", args.Offset, len(lines))
-	}
 	limit := args.Limit
 	if limit <= 0 || limit > maxOutputLines {
 		limit = maxOutputLines
 	}
+	lines, first, total, err := t.readLines(ctx, path, start, limit)
+	if err != nil {
+		return failure("%v", err)
+	}
+	if total == 0 {
+		return toolResult{output: "[empty file]\n"}
+	}
+	last := first + len(lines) // one past the last line fetched
+	if start >= last {
+		if total < 0 {
+			return failure("offset %d is past the end of the file", args.Offset)
+		}
+		return failure("offset %d is past the end of the file (%d lines)", args.Offset, total)
+	}
 	var out strings.Builder
 	end := start
-	for end < len(lines) && end-start < limit {
-		line := fmt.Sprintf("%6d\t%s\n", end+1, lines[end])
+	for end < last && end-start < limit {
+		line := fmt.Sprintf("%6d\t%s\n", end+1, lines[end-first])
 		if out.Len()+len(line) > maxOutputBytes {
 			if end == start {
-				return failure("line %d is %s, over the %s limit; extract part of it with the shell tool", end+1, byteSize(len(lines[end])), byteSize(maxOutputBytes))
+				return failure("line %d is %s, over the %s limit; extract part of it with the shell tool", end+1, byteSize(len(lines[end-first])), byteSize(maxOutputBytes))
 			}
 			break
 		}
 		out.WriteString(line)
 		end++
 	}
-	if end < len(lines) {
-		fmt.Fprintf(&out, "[Showing lines %d-%d of %d. Use offset=%d to continue.]\n", start+1, end, len(lines), end+1)
+	switch {
+	case total < 0:
+		fmt.Fprintf(&out, "[Showing lines %d-%d; the file goes on. Use offset=%d to continue.]\n", start+1, end, end+1)
+	case end < total:
+		fmt.Fprintf(&out, "[Showing lines %d-%d of %d. Use offset=%d to continue.]\n", start+1, end, total, end+1)
 	}
 	return toolResult{output: out.String()}
+}
+
+// readLines returns lines of the file that include the limit lines from the
+// 0-based line start, the 0-based number of the first, and the file's line
+// count, or -1 when that is unknown. Through the client, a file that is large
+// or not on disk to measure is fetched in part: those lines plus one, to tell
+// whether the file goes on.
+func (t *turn) readLines(ctx context.Context, path string, start, limit int) ([]string, int, int, error) {
+	if size := diskSize(path); !t.a.canRead() || size >= 0 && size <= maxFsBytes {
+		text, err := t.readText(ctx, path)
+		if err != nil {
+			return nil, 0, 0, err
+		}
+		lines := splitLines(text)
+		return lines, 0, len(lines), nil
+	}
+	line, count := uint32(start+1), uint32(limit+1)
+	response, err := t.client.ReadTextFile(ctx, schema.ReadTextFileRequest{SessionID: t.s.ID, Path: path, Line: &line, Limit: &count})
+	if err != nil {
+		return nil, 0, 0, fmt.Errorf("read %s: %w", path, err)
+	}
+	lines := splitLines(response.Content)
+	total := start + len(lines)
+	if len(lines) > limit || len(lines) == 0 && start > 0 {
+		total = -1
+	}
+	return lines, start, total, nil
+}
+
+// splitLines splits text into lines without their line endings.
+func splitLines(text string) []string {
+	lines := strings.Split(strings.ReplaceAll(text, "\r\n", "\n"), "\n")
+	if len(lines) > 0 && lines[len(lines)-1] == "" {
+		lines = lines[:len(lines)-1]
+	}
+	return lines
 }
 
 func (t *turn) shell(ctx context.Context, args shellArgs) toolResult {
@@ -438,21 +511,40 @@ func (t *turn) shell(ctx context.Context, args shellArgs) toolResult {
 		timeout = min(time.Duration(args.TimeoutSeconds)*time.Second, 30*time.Minute)
 	}
 	sh := resolveShell(cfg.Shell)
+	env := shellEnv(cfg.ShellEnv)
 	if t.a.canTerminal() {
-		return t.shellTerminal(ctx, sh, args.Command, timeout)
+		return t.shellTerminal(ctx, sh, args.Command, env, timeout)
 	}
-	return t.shellLocal(ctx, sh, args.Command, timeout)
+	return t.shellLocal(ctx, sh, args.Command, env, timeout)
 }
 
-// terminalOutputLimit bounds what a client terminal retains for us.
-const terminalOutputLimit = 4 << 20
+// shellEnv is added to the environment of shell commands. The defaults stop
+// git and pagers from waiting on a terminal nobody types into; configured
+// values win.
+func shellEnv(configured map[string]string) []schema.EnvVariable {
+	env := map[string]string{"GIT_PAGER": "cat", "GIT_TERMINAL_PROMPT": "0", "GIT_EDITOR": "true"}
+	if runtime.GOOS != "windows" {
+		env["PAGER"] = "cat" // Windows has no cat for tools that run $PAGER
+	}
+	maps.Copy(env, configured)
+	var vars []schema.EnvVariable
+	for _, name := range slices.Sorted(maps.Keys(env)) {
+		vars = append(vars, schema.EnvVariable{Name: name, Value: env[name]})
+	}
+	return vars
+}
+
+// terminalOutputLimit bounds what a client terminal retains for us. JSON
+// escaping can more than double it in terminal/output, so it stays well under
+// the 8 MiB frame limit.
+const terminalOutputLimit = 1 << 20
 
 // shellTerminal runs the command in a client terminal embedded in the tool call.
-func (t *turn) shellTerminal(ctx context.Context, sh shell, command string, timeout time.Duration) toolResult {
+func (t *turn) shellTerminal(ctx context.Context, sh shell, command string, env []schema.EnvVariable, timeout time.Duration) toolResult {
 	limit := uint64(terminalOutputLimit)
 	cwd := t.s.Cwd
 	created, err := t.client.CreateTerminal(ctx, schema.CreateTerminalRequest{
-		SessionID: t.s.ID, Command: sh.path, Args: sh.args(command), Cwd: &cwd, OutputByteLimit: &limit,
+		SessionID: t.s.ID, Command: sh.path, Args: sh.args(command), Cwd: &cwd, Env: env, OutputByteLimit: &limit,
 	})
 	if err != nil {
 		return failure("create terminal: %v", err)
@@ -497,7 +589,7 @@ func (t *turn) shellTerminal(ctx context.Context, sh shell, command string, time
 
 // shellLocal runs the command directly, spooling output to a temp file so
 // runaway commands cannot exhaust memory.
-func (t *turn) shellLocal(ctx context.Context, sh shell, command string, timeout time.Duration) toolResult {
+func (t *turn) shellLocal(ctx context.Context, sh shell, command string, env []schema.EnvVariable, timeout time.Duration) toolResult {
 	spool, err := os.CreateTemp("", "micro-agent-shell-*.log")
 	if err != nil {
 		return failure("%v", err)
@@ -508,6 +600,10 @@ func (t *turn) shellLocal(ctx context.Context, sh shell, command string, timeout
 	cmd := exec.CommandContext(run, sh.path, sh.args(command)...)
 	prepareCommand(cmd, sh, command)
 	cmd.Dir = t.s.Cwd
+	cmd.Env = os.Environ() // later entries win
+	for _, v := range env {
+		cmd.Env = append(cmd.Env, v.Name+"="+v.Value)
+	}
 	cmd.WaitDelay = 2 * time.Second
 	cmd.Stdout = spool
 	cmd.Stderr = spool

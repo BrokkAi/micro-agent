@@ -13,6 +13,7 @@ import (
 	"slices"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/BrokkAi/acp-go"
 	acpmcp "github.com/BrokkAi/acp-go/mcp"
@@ -222,6 +223,7 @@ func TestConfigFormUsesTypedElicitation(t *testing.T) {
 		SessionID       schema.SessionId `json:"sessionId"`
 		RequestedSchema struct {
 			Properties map[string]struct {
+				Type    string              `json:"type"`
 				Default any                 `json:"default"`
 				OneOf   []schema.EnumOption `json:"oneOf"`
 			} `json:"properties"`
@@ -243,6 +245,14 @@ func TestConfigFormUsesTypedElicitation(t *testing.T) {
 	if efforts := wire.RequestedSchema.Properties["reasoning_effort"].OneOf; len(efforts) == 0 || efforts[0].Title != "Model default" {
 		t.Errorf("reasoning_effort options = %+v", efforts)
 	}
+	for key, kind := range map[string]string{"auto_compact": "boolean", "max_turns": "integer", "shell": "string"} {
+		if property := wire.RequestedSchema.Properties[key]; property.Type != kind {
+			t.Errorf("%s type = %q, want %s", key, property.Type, kind)
+		}
+	}
+	if compact := wire.RequestedSchema.Properties["auto_compact"].Default; compact != true {
+		t.Errorf("auto_compact default = %v", compact)
+	}
 
 	// Sending back the values the form showed saves nothing either.
 	shown := map[string]schema.ElicitationContentValue{}
@@ -257,9 +267,9 @@ func TestConfigFormUsesTypedElicitation(t *testing.T) {
 		t.Fatalf("unchanged form saved %+v", cfg)
 	}
 
-	reply(map[string]schema.ElicitationContentValue{"max_turns": 5, "default_mode": "plan"})
+	reply(map[string]schema.ElicitationContentValue{"max_turns": 5, "default_mode": "plan", "auto_compact": false})
 	h.prompt(session, "/config")
-	if cfg := h.store.Get(); cfg.MaxTurns != 5 || cfg.DefaultMode != "plan" {
+	if cfg := h.store.Get(); cfg.MaxTurns != 5 || cfg.DefaultMode != "plan" || cfg.AutoCompactEnabled() {
 		t.Fatalf("config = %+v", cfg)
 	}
 }
@@ -406,6 +416,48 @@ func TestCancelStopsPrompt(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(h.dir, "out.txt")); err == nil {
 		t.Fatal("command ran after cancel")
+	}
+}
+
+func TestPromptReplacesRunningTurn(t *testing.T) {
+	for name, cancelFirst := range map[string]bool{"after cancel": true, "while running": false} {
+		t.Run(name, func(t *testing.T) {
+			h := newHarness(t, schema.ClientCapabilities{Terminal: ptr(true)})
+			h.router.responses = [][]string{
+				toolCallChunks("call_1", "shell", map[string]string{"command": "sleep 60"}),
+				textChunks("redirected"),
+			}
+			session := h.newSession()
+			type result struct {
+				response schema.PromptResponse
+				err      error
+			}
+			second := make(chan result, 1)
+			release := make(chan struct{})
+			defer close(release)
+			onTerminal(h, func() {
+				if cancelFirst {
+					_ = h.conn.Notify(context.Background(), schema.SessionCancelMethodName, schema.CancelNotification{SessionID: session})
+				}
+				go func() {
+					response, err := send[schema.PromptResponse](h, schema.SessionPromptMethodName, schema.PromptRequest{SessionID: session, Prompt: []schema.ContentBlock{textBlock("do this instead")}})
+					second <- result{response, err}
+				}()
+				<-release // the turn stops waiting only when cancelled
+			})
+			// Keep the cancelled turn unwinding for a while.
+			h.on(schema.TerminalOutputMethodName, func(json.RawMessage) (any, error) {
+				time.Sleep(200 * time.Millisecond)
+				return schema.TerminalOutputResponse{}, nil
+			})
+			if reason := h.prompt(session, "run it").StopReason; reason != schema.StopReasonCancelled {
+				t.Fatalf("first stop reason %s", reason)
+			}
+			r := <-second
+			if r.err != nil || r.response.StopReason != schema.StopReasonEndTurn {
+				t.Fatalf("second prompt = %+v, %v", r.response, r.err)
+			}
+		})
 	}
 }
 

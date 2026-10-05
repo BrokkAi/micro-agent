@@ -215,7 +215,7 @@ func (t *turn) configure(ctx context.Context, args string) map[string]string {
 		cfg := t.a.cfg.Get()
 		var fields []field
 		for _, key := range config.Keys {
-			f := field{key: key, title: key, value: config.Value(cfg, key)}
+			f := field{key: key, title: key, value: config.Value(cfg, key), kind: config.Kind(key)}
 			switch key {
 			case "reasoning_effort":
 				f.options = []schema.EnumOption{{Const: "", Title: "Model default"}}
@@ -227,8 +227,6 @@ func (t *turn) configure(ctx context.Context, args string) map[string]string {
 				for _, m := range modes {
 					f.options = append(f.options, schema.EnumOption{Const: m.id, Title: m.name, Description: ptr(m.description)})
 				}
-			case "max_turns", "max_tokens", "shell_timeout_seconds":
-				f.integer = true
 			}
 			fields = append(fields, f)
 		}
@@ -293,18 +291,19 @@ func (t *turn) login(ctx context.Context, key string) bool {
 	if key == "" {
 		return false
 	}
-	if err := t.a.cfg.Update(func(c *config.Config) error { c.APIKey = key; return nil }); err != nil {
+	if err := t.a.cfg.SetAPIKey(key); err != nil {
 		t.say("Could not save API key: %v", err)
 		return false
 	}
 	return true
 }
 
-// field is one form input.
+// field is one form input. kind is a config.Kind; a field without one is a
+// string.
 type field struct {
-	key, title, description, value string
-	options                        []schema.EnumOption
-	integer, required              bool
+	key, title, description, value, kind string
+	options                              []schema.EnumOption
+	required                             bool
 }
 
 // form asks the user to fill fields. It returns false when the client cannot
@@ -318,13 +317,15 @@ func (t *turn) form(ctx context.Context, message string, fields []field) (map[st
 		if f.description != "" {
 			description = ptr(f.description)
 		}
-		switch {
-		case f.integer:
+		switch f.kind {
+		case "integer":
 			integer := &schema.IntegerPropertySchema{Title: ptr(f.title), Description: description, Minimum: ptr(int64(0))}
 			if n, err := strconv.ParseInt(f.value, 10, 64); err == nil {
 				integer.Default = &n
 			}
 			property.Integer = integer
+		case "boolean":
+			property.Boolean = &schema.BooleanPropertySchema{Title: ptr(f.title), Description: description, Default: ptr(f.value == "true")}
 		default:
 			str := &schema.StringPropertySchema{Title: ptr(f.title), Description: description, OneOf: f.options}
 			if f.value != "" || len(f.options) > 0 {
