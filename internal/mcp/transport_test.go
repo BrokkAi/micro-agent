@@ -8,14 +8,15 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"strings"
 	"sync"
 	"testing"
 	"time"
 )
 
 func TestSSE(t *testing.T) {
-	outbound := make(chan []byte, 16)
-	pong := make(chan message, 1)
+	outbound := make(chan string, 16)
+	answers := make(chan message, 4)
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /mcp/sse", func(w http.ResponseWriter, r *http.Request) {
 		if r.Header.Get("Accept") != "text/event-stream" || r.Header.Get("Authorization") != "Bearer k" {
@@ -23,12 +24,13 @@ func TestSSE(t *testing.T) {
 			return
 		}
 		w.Header().Set("Content-Type", "text/event-stream")
-		fmt.Fprint(w, ": hello\nevent: endpoint\ndata: messages?session=1\n\n")
+		// The early ping comes before the endpoint, so the client must drop it.
+		fmt.Fprint(w, ": hello\ndata: {\"jsonrpc\":\"2.0\",\"id\":\"early\",\"method\":\"ping\"}\n\nevent: endpoint\ndata: messages?session=1\n\n")
 		w.(http.Flusher).Flush()
 		for {
 			select {
-			case data := <-outbound:
-				fmt.Fprintf(w, "event: message\ndata: %s\n\n", data)
+			case event := <-outbound:
+				fmt.Fprint(w, event)
 				w.(http.Flusher).Flush()
 			case <-r.Context().Done():
 				return
@@ -45,32 +47,32 @@ func TestSSE(t *testing.T) {
 		w.WriteHeader(http.StatusAccepted)
 		switch {
 		case msg.Method == "notifications/initialized":
-			outbound <- []byte(`{"jsonrpc":"2.0","id":"srv-1","method":"ping"}`)
+			outbound <- "data: {\"jsonrpc\":\"2.0\",\"id\":\"srv-1\",\"method\":\"ping\"}\n\n" // unnamed event
 		case msg.Method == "":
-			pong <- msg
+			answers <- msg
 		default:
 			if reply := handle(msg); reply != nil {
 				data, _ := json.Marshal(reply)
-				outbound <- data
+				outbound <- fmt.Sprintf("event: message\ndata: %s\n\n", data)
 			}
 		}
 	})
 	server := httptest.NewServer(mux)
 	defer server.Close()
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
 	client, err := Connect(ctx, Config{Name: "fake", SSE: &SSEOptions{URL: server.URL + "/mcp/sse", Headers: map[string]string{"Authorization": "Bearer k"}}}, ClientInfo{Name: "test", Version: "1"})
+	cancel() // like connectMCP: the stream must outlive the connect ctx
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer client.Close()
 	exercise(t, client)
 	select {
-	case msg := <-pong:
+	case msg := <-answers:
 		if string(msg.ID) != `"srv-1"` || string(msg.Result) != `{}` {
-			t.Errorf("ping reply = %+v", msg)
+			t.Errorf("first ping reply = %+v, want srv-1", msg)
 		}
-	case <-ctx.Done():
+	case <-time.After(5 * time.Second):
 		t.Fatal("server ping was not answered")
 	}
 }
@@ -83,8 +85,8 @@ func TestSSEStreamEndsBeforeEndpoint(t *testing.T) {
 	defer server.Close()
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	if _, err := ConnectSSE(ctx, "fake", SSEOptions{URL: server.URL}, ClientInfo{}); err == nil {
-		t.Fatal("connected without an endpoint event")
+	if _, err := ConnectSSE(ctx, "fake", SSEOptions{URL: server.URL}, ClientInfo{}); err == nil || !strings.Contains(err.Error(), "before naming an endpoint") {
+		t.Fatalf("err = %v, want the stream to end the connect", err)
 	}
 }
 
@@ -177,6 +179,17 @@ func TestACP(t *testing.T) {
 	}
 	if n := calls[1].params["arguments"].(map[string]any)["n"]; n != json.Number("12345678901234567890") {
 		t.Errorf("large integer argument = %#v", n)
+	}
+}
+
+func TestConnectACPNeedsIDAndCall(t *testing.T) {
+	call := func(context.Context, string, string, string, map[string]any, func(string, map[string]any)) (json.RawMessage, *RPCError, error) {
+		return nil, nil, nil
+	}
+	for _, options := range []ACPOptions{{Call: call}, {ID: "srv"}} {
+		if _, err := ConnectACP(context.Background(), "hosted", options, ClientInfo{}); err == nil {
+			t.Errorf("ConnectACP(ID %q, Call set %v) succeeded", options.ID, options.Call != nil)
+		}
 	}
 }
 

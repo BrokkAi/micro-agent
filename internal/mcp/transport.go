@@ -435,9 +435,9 @@ func setHeaders(request *http.Request, headers map[string]string) {
 	}
 }
 
-func statusError(url string, response *http.Response) error {
+func statusError(target string, response *http.Response) error {
 	body, _ := io.ReadAll(io.LimitReader(response.Body, 8<<10))
-	return fmt.Errorf("mcp http %s: %s %s", url, response.Status, strings.TrimSpace(string(body)))
+	return fmt.Errorf("mcp http %s: %s %s", target, response.Status, strings.TrimSpace(string(body)))
 }
 
 // deliver hands a JSON-RPC message or batch from an HTTP body or event to

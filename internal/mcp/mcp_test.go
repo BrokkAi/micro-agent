@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -142,10 +143,12 @@ func (p pipe) send(_ context.Context, msg message) error {
 
 func (pipe) close() error { return nil }
 
-// elicitingClient connects to a fake server whose tools/call asks the client
-// for input and returns the client's raw JSON-RPC reply as its text. It also
-// returns the capabilities the client sent in initialize.
-func elicitingClient(t *testing.T, info ClientInfo) (*Client, map[string]any) {
+const askName = `{"message":"Name?","requestedSchema":{"type":"object","properties":{"name":{"type":"string"}}}}`
+
+// elicitingClient connects to a fake server whose tools/call sends
+// elicitation/create with params and returns the client's raw JSON-RPC reply
+// as its text. It also returns the capabilities the client sent in initialize.
+func elicitingClient(t *testing.T, info ClientInfo, params string) (*Client, map[string]any) {
 	t.Helper()
 	client := newClient("fake", info)
 	var capabilities map[string]any
@@ -160,8 +163,7 @@ func elicitingClient(t *testing.T, info ClientInfo) (*Client, map[string]any) {
 			capabilities = params.Capabilities
 			client.receive(*handle(msg))
 		case msg.Method == "tools/call":
-			client.receive(message{JSONRPC: "2.0", ID: json.RawMessage(`"e1"`), Method: "elicitation/create",
-				Params: json.RawMessage(`{"message":"Name?","requestedSchema":{"type":"object","properties":{"name":{"type":"string"}}}}`)})
+			client.receive(message{JSONRPC: "2.0", ID: json.RawMessage(`"e1"`), Method: "elicitation/create", Params: json.RawMessage(params)})
 			answer, _ := json.Marshal(<-answers)
 			result, _ := json.Marshal(map[string]any{"content": []any{map[string]any{"type": "text", "text": string(answer)}}})
 			client.receive(message{JSONRPC: "2.0", ID: msg.ID, Result: result})
@@ -210,7 +212,7 @@ func TestElicitation(t *testing.T) {
 				}
 				return want, nil
 			}
-			client, capabilities := elicitingClient(t, ClientInfo{Name: "test", Version: "1", Elicit: hook})
+			client, capabilities := elicitingClient(t, ClientInfo{Name: "test", Version: "1", Elicit: hook}, askName)
 			if _, ok := capabilities["elicitation"]; !ok {
 				t.Errorf("capabilities = %v, want elicitation", capabilities)
 			}
@@ -231,7 +233,7 @@ func TestElicitation(t *testing.T) {
 }
 
 func TestElicitationWithoutHook(t *testing.T) {
-	client, capabilities := elicitingClient(t, ClientInfo{Name: "test", Version: "1"})
+	client, capabilities := elicitingClient(t, ClientInfo{Name: "test", Version: "1"}, askName)
 	if _, ok := capabilities["elicitation"]; ok {
 		t.Errorf("capabilities = %v, want no elicitation", capabilities)
 	}
@@ -239,6 +241,29 @@ func TestElicitationWithoutHook(t *testing.T) {
 	defer cancel()
 	if reply := elicit(ctx, t, client); reply.Error == nil || reply.Error.Code != -32601 {
 		t.Errorf("reply = %+v, want -32601", reply)
+	}
+}
+
+func TestElicitationErrors(t *testing.T) {
+	hook := func(context.Context, ElicitRequest) (ElicitResult, error) {
+		return ElicitResult{}, errors.New("no terminal")
+	}
+	for _, c := range []struct {
+		name, params string
+		code         int
+		message      string
+	}{
+		{"bad params", `"x"`, -32602, "cannot unmarshal"},
+		{"hook error", askName, -32603, "no terminal"},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			client, _ := elicitingClient(t, ClientInfo{Name: "test", Version: "1", Elicit: hook}, c.params)
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			if reply := elicit(ctx, t, client); reply.Error == nil || reply.Error.Code != c.code || !strings.Contains(reply.Error.Message, c.message) {
+				t.Errorf("reply = %+v, want %d %q", reply, c.code, c.message)
+			}
+		})
 	}
 }
 
