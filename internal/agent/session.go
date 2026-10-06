@@ -60,6 +60,10 @@ type session struct {
 	decisions map[string]bool
 	// deleted stops a still-running turn from re-saving a deleted session.
 	deleted bool
+	// mcpFailures holds servers that failed to start, for the draft-v2 facade
+	// to report on the first prompt (v1 reports them right after the response
+	// that introduces the session).
+	mcpFailures []mcpFailure
 	// contextUsed and contextSize come from the last model call and the
 	// model's window; 0 until known.
 	contextUsed uint64
@@ -147,9 +151,8 @@ func (a *Agent) lookup(id schema.SessionId) (*session, error) {
 func (a *Agent) open(ctx context.Context, s *session, servers []schema.McpServer) []schema.SessionUpdate {
 	s.decisions = map[string]bool{}
 	var notices []schema.SessionUpdate
-	var failures []mcpFailure
-	s.servers, failures = a.connectMCP(ctx, s, servers)
-	for _, failure := range failures {
+	s.servers, s.mcpFailures = a.connectMCP(ctx, s, servers)
+	for _, failure := range s.mcpFailures {
 		notices = append(notices, a.notice(schema.NoticeSeverityWarning, fmt.Sprintf("MCP server `%s` failed to start", failure.name), failure.err.Error()))
 	}
 	a.mu.Lock()
@@ -180,9 +183,39 @@ func (s *session) stop() {
 	}
 }
 
+// takePending returns and clears the notes about MCP servers that failed to
+// start, for the draft-v2 facade to report once the client knows the session.
+func (s *session) takePending() []string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	var notes []string
+	for _, failure := range s.mcpFailures {
+		notes = append(notes, fmt.Sprintf("⚠️ MCP server `%s` failed to start: %v\n\n", failure.name, failure.err))
+	}
+	s.mcpFailures = nil
+	return notes
+}
+
 func (a *Agent) NewSession(ctx context.Context, request schema.NewSessionRequest) (schema.NewSessionResponse, error) {
-	if err := checkRoots(request.Cwd, request.AdditionalDirectories); err != nil {
+	s, notices, err := a.createSession(ctx, request)
+	if err != nil {
 		return schema.NewSessionResponse{}, err
+	}
+	// The client learns the session ID from the response, so its updates go
+	// out right behind it.
+	a.announce(s, notices, updater{a: a, id: s.ID, queued: true})
+	return schema.NewSessionResponse{
+		SessionID:     s.ID,
+		Modes:         modeState(s.Mode),
+		ConfigOptions: a.configOptions(s),
+	}, nil
+}
+
+// createSession opens and registers a session without announcing it, for the
+// draft-v2 facade whose response carries the first state itself.
+func (a *Agent) createSession(ctx context.Context, request schema.NewSessionRequest) (*session, []schema.SessionUpdate, error) {
+	if err := checkRoots(request.Cwd, request.AdditionalDirectories); err != nil {
+		return nil, nil, err
 	}
 	cfg := a.cfg.Get()
 	s := &session{record: record{
@@ -194,14 +227,7 @@ func (a *Agent) NewSession(ctx context.Context, request schema.NewSessionRequest
 		Effort: cfg.ReasoningEffort,
 	}}
 	notices := a.open(ctx, s, request.MCPServers)
-	// The client learns the session ID from the response, so its updates go
-	// out right behind it.
-	a.announce(s, notices, updater{a: a, id: s.ID, queued: true})
-	return schema.NewSessionResponse{
-		SessionID:     s.ID,
-		Modes:         modeState(s.Mode),
-		ConfigOptions: a.configOptions(s),
-	}, nil
+	return s, notices, nil
 }
 
 func (a *Agent) LoadSession(ctx context.Context, request schema.LoadSessionRequest) (schema.LoadSessionResponse, error) {

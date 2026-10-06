@@ -40,6 +40,14 @@ func (a *Agent) Prompt(parent context.Context, request schema.PromptRequest) (sc
 // sink. ctx must come from s.begin.
 func (a *Agent) runTurn(ctx context.Context, s *session, prompt []schema.ContentBlock, host host, updates updateSink) (schema.PromptResponse, error) {
 	t := &turn{a: a, s: s, client: host, updates: updates}
+	return a.runTurnWith(ctx, t, prompt)
+}
+
+// runTurnWith runs one prompt with a turn the caller built, for the draft-v2
+// facade that also emits the user message itself.
+func (a *Agent) runTurnWith(ctx context.Context, t *turn, prompt []schema.ContentBlock) (schema.PromptResponse, error) {
+	s := t.s
+	updates := t.updates
 	if name, args, ok := parseCommand(prompt); ok {
 		return t.command(ctx, name, args)
 	}

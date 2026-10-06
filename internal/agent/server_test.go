@@ -30,29 +30,23 @@ func rpcCode(err error) int {
 }
 
 func TestInitializeNegotiatesVersion(t *testing.T) {
-	for name, params := range map[string]string{
-		"v1 shape": `{"protocolVersion":2,"clientCapabilities":{"auth":{"terminal":true}},"clientInfo":{"name":"test","version":"1"}}`,
-		"v2 shape": `{"protocolVersion":2,"capabilities":{"auth":{"terminal":{}}},"info":{"name":"test","version":"1"}}`,
-	} {
-		t.Run(name, func(t *testing.T) {
-			h := startHarness(t)
-			init, err := h.initialize(json.RawMessage(params))
-			if err != nil {
-				t.Fatal(err)
-			}
-			if init.ProtocolVersion != 1 {
-				t.Fatalf("protocol version = %d", init.ProtocolVersion)
-			}
-			if !slices.ContainsFunc(init.AuthMethods, func(m schema.AuthMethod) bool { return m.Terminal != nil }) {
-				t.Fatalf("terminal capability lost: %+v", init.AuthMethods)
-			}
-			if _, err := h.initialize(json.RawMessage(params)); rpcCode(err) != -32600 {
-				t.Fatalf("second initialize: %v", err)
-			}
-		})
+	params := `{"protocolVersion":1,"clientCapabilities":{"auth":{"terminal":true}},"clientInfo":{"name":"test","version":"1"}}`
+	h := startHarness(t)
+	init, err := h.initialize(json.RawMessage(params))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if init.ProtocolVersion != 1 {
+		t.Fatalf("protocol version = %d", init.ProtocolVersion)
+	}
+	if !slices.ContainsFunc(init.AuthMethods, func(m schema.AuthMethod) bool { return m.Terminal != nil }) {
+		t.Fatalf("terminal capability lost: %+v", init.AuthMethods)
+	}
+	if _, err := h.initialize(json.RawMessage(params)); rpcCode(err) != -32600 {
+		t.Fatalf("second initialize: %v", err)
 	}
 
-	h := startHarness(t)
+	h = startHarness(t)
 	if _, err := h.initialize(json.RawMessage(`{"protocolVersion":0}`)); rpcCode(err) != -32600 {
 		t.Fatalf("version 0: %v", err)
 	}

@@ -5,6 +5,7 @@ package agent
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/url"
 	"os"
@@ -492,6 +493,7 @@ type mcpFailure struct {
 // concurrently. Failed servers are skipped, with a failure for the user.
 func (a *Agent) connectMCP(ctx context.Context, s *session, servers []schema.McpServer) ([]*mcp.Client, []mcpFailure) {
 	var configs []mcp.Config
+	var preset []mcpFailure
 	for _, server := range servers {
 		switch {
 		case server.Stdio != nil:
@@ -513,6 +515,11 @@ func (a *Agent) connectMCP(ctx context.Context, s *session, servers []schema.Mcp
 			}
 			configs = append(configs, mcp.Config{Name: server.SSE.Name, SSE: &mcp.SSEOptions{URL: server.SSE.URL, Headers: headers}})
 		case server.ACP != nil:
+			if a.client == nil {
+				// Only the v1 connection carries the mcp/message binding.
+				preset = append(preset, mcpFailure{name: server.ACP.Name, err: errors.New("the MCP-over-ACP transport is not available on draft v2 connections")})
+				continue
+			}
 			configs = append(configs, mcp.Config{Name: server.ACP.Name, ACP: &mcp.ACPOptions{
 				ID:   string(server.ACP.ServerID),
 				Call: a.callMCPMessage,
@@ -553,7 +560,7 @@ func (a *Agent) connectMCP(ctx context.Context, s *session, servers []schema.Mcp
 		})
 	}
 	wg.Wait()
-	var failures []mcpFailure
+	failures := preset
 	for i, err := range errs {
 		if err != nil {
 			failures = append(failures, mcpFailure{name: configs[i].Name, err: err})

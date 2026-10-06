@@ -14,11 +14,31 @@ import (
 	acpmcp "github.com/BrokkAi/acp-go/mcp"
 	schema "github.com/BrokkAi/acp-go/schema/unstable"
 	"github.com/BrokkAi/acp-go/unstable"
+	agent2 "github.com/BrokkAi/acp-go/v2/agent"
 )
 
 // Serve runs the agent over one ACP connection until ctx ends or the client
 // hangs up, which returns nil.
 func Serve(ctx context.Context, a *Agent, in io.ReadCloser, out io.WriteCloser) error {
+	// The first frame chooses the protocol version: a draft-v2 initialize is
+	// served as v2, everything else as v1 with the frame replayed.
+	reader := bufio.NewReaderSize(in, 64<<10)
+	line, err := reader.ReadBytes('\n')
+	if err != nil && len(line) == 0 {
+		if errors.Is(err, io.EOF) {
+			return nil
+		}
+		return err
+	}
+	if v2, rewritten := v2Initialize(line); v2 {
+		return agent2.New(NewV2(a)).Serve(ctx, &prefixReader{prefix: rewritten, rest: reader, in: in}, out)
+	}
+	return a.serveV1(ctx, &prefixReader{prefix: line, rest: reader, in: in}, out)
+}
+
+// serveV1 runs the version 1 server, whose reader starts with one frame
+// already read.
+func (a *Agent) serveV1(ctx context.Context, in io.ReadCloser, out io.WriteCloser) error {
 	ready := make(chan struct{})
 	w := &frameWriter{out: out, queued: map[schema.SessionId][][]byte{}}
 	r := newFrameReader(in, w, ready)
@@ -40,6 +60,60 @@ func Serve(ctx context.Context, a *Agent, in io.ReadCloser, out io.WriteCloser) 
 		}
 		return nil
 	}
+}
+
+// prefixReader hands out one buffered frame before the rest of the stream.
+type prefixReader struct {
+	prefix []byte
+	rest   io.Reader
+	in     io.ReadCloser
+}
+
+func (r *prefixReader) Read(p []byte) (int, error) {
+	if len(r.prefix) > 0 {
+		n := copy(p, r.prefix)
+		r.prefix = r.prefix[n:]
+		return n, nil
+	}
+	return r.rest.Read(p)
+}
+
+func (r *prefixReader) Close() error { return r.in.Close() }
+
+// v2Initialize reports whether the first frame is a draft-v2 initialize, and
+// rewrites a newer compatible version to 2 the way acp-go's router does.
+func v2Initialize(line []byte) (bool, []byte) {
+	trimmed := bytes.TrimSpace(line)
+	if len(trimmed) == 0 || trimmed[0] != '{' {
+		return false, line
+	}
+	var frame struct {
+		Method string `json:"method"`
+		Params struct {
+			ProtocolVersion *int `json:"protocolVersion"`
+		} `json:"params"`
+	}
+	if json.Unmarshal(trimmed, &frame) != nil || frame.Method != schema.InitializeMethodName || frame.Params.ProtocolVersion == nil {
+		return false, line
+	}
+	switch version := *frame.Params.ProtocolVersion; {
+	case version == 2:
+		return true, line
+	case version > 2:
+		var raw map[string]any
+		if json.Unmarshal(trimmed, &raw) != nil {
+			return false, line
+		}
+		if params, ok := raw["params"].(map[string]any); ok {
+			params["protocolVersion"] = 2
+		}
+		rewritten, err := json.Marshal(raw)
+		if err != nil {
+			return false, line
+		}
+		return true, append(rewritten, '\n')
+	}
+	return false, line
 }
 
 // guard answers initialize and turns away everything before it, and any
