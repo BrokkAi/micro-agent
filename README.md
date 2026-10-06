@@ -9,6 +9,9 @@ go install github.com/BrokkAi/micro-agent@latest
 micro-agent login        # or set OPENROUTER_API_KEY, or use /login in your editor
 ```
 
+Release binaries for Linux, macOS and Windows (amd64 and arm64) with
+checksums are on the [releases page](https://github.com/BrokkAi/micro-agent/releases).
+
 Point your ACP client (Zed, etc.) at the `micro-agent` binary.
 
 ## ACP support
@@ -55,3 +58,17 @@ Slash commands: `/help`, `/model`, `/mode`, `/effort`, `/config` (opens a form, 
 The `shell` tool runs PowerShell (`pwsh`, then `powershell`, then `cmd`) on Windows and `bash` (falling back to `sh`) elsewhere; set `shell` to override, e.g. `"shell": "C:\\Program Files\\Git\\bin\\bash.exe"`. Tool output over 2000 lines or 50KB is cut down for the model (shell keeps the end) and the full text is saved to a temp file the model can read.
 
 If the project has an `AGENTS.md`, it is added to the system prompt.
+
+## Releases
+
+Pushing a `v*` tag runs the CI matrix (Linux, macOS, Windows), the license
+checks, and a GoReleaser snapshot, then publishes versioned archives plus
+`checksums.txt`. GoReleaser injects the tag into `micro-agent -version`.
+
+## License
+
+micro-agent is [MIT licensed](LICENSE). [NOTICE](NOTICE) and
+[licenses/THIRD_PARTY_NOTICES.txt](licenses/THIRD_PARTY_NOTICES.txt) carry the
+terms of everything a released binary embeds, including the Apache-2.0
+`acp-go` dependency and the Go runtime notices. CI keeps the dependency
+policy, the notices file, and the shipped archives in sync.

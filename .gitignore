@@ -1,2 +1,5 @@
 /micro-agent
 /micro-agent.exe
+/dist/
+/bin/
+*.test

@@ -1,0 +1,15 @@
+micro-agent
+Copyright 2026 BrokkAi contributors
+
+This project is licensed under the MIT License. See LICENSE for the full
+terms. Third-party terms and attribution are provided in
+licenses/THIRD_PARTY_NOTICES.txt.
+
+micro-agent statically links github.com/BrokkAi/acp-go, distributed under
+the Apache License, Version 2.0. Its license and NOTICE are reproduced in
+full in licenses/THIRD_PARTY_NOTICES.txt.
+
+The pinned Agent Client Protocol schema artifacts and generated bindings
+inside github.com/BrokkAi/acp-go are distributed by the ACP project
+(https://github.com/agentclientprotocol/agent-client-protocol) under the
+Apache License 2.0.

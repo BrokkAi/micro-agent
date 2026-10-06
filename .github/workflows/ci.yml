@@ -1,25 +1,96 @@
 name: CI
 on:
   push:
-    branches: [main]
+    branches: ["**"]
   pull_request:
+  workflow_dispatch:
+  workflow_call:
+
 permissions:
   contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/') }}
+
 jobs:
   test:
+    name: Go (${{ matrix.os }})
     strategy:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, macos-latest, windows-latest]
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    env:
+      GOFLAGS: -mod=readonly
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
-      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
         with:
           go-version-file: go.mod
-          cache: false
-      - name: gofmt
+          cache: true
+      # Windows checkouts use CRLF, which gofmt reports as unformatted.
+      - name: Check formatting
         if: runner.os != 'Windows'
-        run: test -z "$(gofmt -l .)" || (gofmt -l . && exit 1)
-      - run: go vet ./...
-      - run: go test -race ./...
+        run: |
+          unformatted=$(gofmt -l .)
+          if [ -n "$unformatted" ]; then
+            printf '%s\n' "$unformatted"
+            exit 1
+          fi
+      - name: Check dependency licenses and notices
+        if: runner.os != 'Windows'
+        run: |
+          python3 scripts/licenses.py
+          python3 -m unittest discover -s scripts -p '*_test.py'
+      - name: Verify dependencies
+        shell: bash
+        run: |
+          go mod download
+          go mod verify
+          go mod tidy
+          git diff --exit-code -- go.mod go.sum
+      - name: Vet
+        run: go vet ./...
+      - name: Test with race detector
+        run: go test -race -timeout 10m ./...
+      - name: Build
+        run: go build -trimpath -o bin/micro-agent .
+
+  packages:
+    name: Release packages (dry run)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      GOFLAGS: -mod=readonly
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Check release configuration
+        uses: goreleaser/goreleaser-action@f06c13b6b1a9625abc9e6e439d9c05a8f2190e94 # v7
+        with:
+          version: v2.18.2
+          args: check
+      - name: Build all release archives without publishing
+        uses: goreleaser/goreleaser-action@f06c13b6b1a9625abc9e6e439d9c05a8f2190e94 # v7
+        with:
+          version: v2.18.2
+          args: release --snapshot --clean --skip=publish
+      - name: Verify checksums, notices, and packaged executable
+        run: |
+          (cd dist && sha256sum --check checksums.txt)
+          mkdir -p dist/smoke
+          tar -xzf dist/micro-agent_*_linux_amd64.tar.gz -C dist/smoke
+          test -s dist/smoke/LICENSE
+          test -s dist/smoke/NOTICE
+          test -s dist/smoke/licenses/THIRD_PARTY_NOTICES.txt
+          ./dist/smoke/micro-agent --version

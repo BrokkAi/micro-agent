@@ -1,0 +1,53 @@
+version: 2
+project_name: micro-agent
+
+builds:
+  - id: micro-agent
+    main: .
+    binary: micro-agent
+    env:
+      - CGO_ENABLED=0
+    goos:
+      - linux
+      - darwin
+      - windows
+    goarch:
+      - amd64
+      - arm64
+    flags:
+      - -trimpath
+    ldflags:
+      - -s -w -X main.version={{ .Version }}
+
+archives:
+  - formats: [tar.gz]
+    name_template: "{{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
+    format_overrides:
+      - goos: windows
+        formats: [zip]
+    files:
+      - LICENSE
+      - NOTICE
+      - README.md
+      - licenses/README.md
+      - licenses/THIRD_PARTY_NOTICES.txt
+      - licenses/GO_LICENSE.txt
+      - licenses/GO_PATENTS.txt
+      - licenses/UNICODE_LICENSE.txt
+
+checksum:
+  name_template: checksums.txt
+  algorithm: sha256
+
+snapshot:
+  version_template: "0.0.0-dev"
+
+changelog:
+  sort: asc
+
+release:
+  github:
+    owner: BrokkAi
+    name: micro-agent
+  prerelease: auto
+  make_latest: auto

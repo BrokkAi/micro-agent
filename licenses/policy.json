@@ -1,0 +1,35 @@
+{
+  "go_version": "1.27.1",
+  "project_license_sha256": "0152776b9e920d1443ea31af964448dab9452706f008523190dd0b89d7eda144",
+  "modules": {
+    "github.com/BrokkAi/acp-go": {
+      "version": "v0.12.1",
+      "license": "Apache-2.0",
+      "source": "https://github.com/BrokkAi/acp-go",
+      "files": {
+        "LICENSE": "cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30",
+        "NOTICE": "eb3c683102ed8745530ac8eecbe216e1c08584448f82f9bfb7b636880a1d7156"
+      }
+    }
+  },
+  "supplemental": [
+    {
+      "file": "licenses/GO_LICENSE.txt",
+      "title": "Go runtime and standard library (BSD-3-Clause)",
+      "source": "https://go.googlesource.com/go/+/refs/tags/go1.27.1/LICENSE",
+      "sha256": "911f8f5782931320f5b8d1160a76365b83aea6447ee6c04fa6d5591467db9dad"
+    },
+    {
+      "file": "licenses/GO_PATENTS.txt",
+      "title": "Go additional patent grant",
+      "source": "https://go.googlesource.com/go/+/refs/tags/go1.27.1/PATENTS",
+      "sha256": "96f408bfae65bf137fc2525d3ecb030271c50c1e90799f87abf8846d8dd505cc"
+    },
+    {
+      "file": "licenses/UNICODE_LICENSE.txt",
+      "title": "Unicode data used by Go (Unicode-3.0)",
+      "source": "https://www.unicode.org/license.txt",
+      "sha256": "e7a93b009565cfce55919a381437ac4db883e9da2126fa28b91d12732bc53d96"
+    }
+  ]
+}
