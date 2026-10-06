@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/BrokkAi/acp-go"
+	acpmcp "github.com/BrokkAi/acp-go/mcp"
 	schema "github.com/BrokkAi/acp-go/schema/unstable"
 	"github.com/BrokkAi/micro-agent/internal/config"
 	"github.com/BrokkAi/micro-agent/internal/mcp"
@@ -61,7 +62,7 @@ func (a *Agent) Initialize(_ context.Context, request schema.InitializeRequest) 
 		AuthMethods:     methods,
 		AgentCapabilities: &schema.AgentCapabilities{
 			LoadSession:        ptr(true),
-			MCPCapabilities:    &schema.McpCapabilities{HTTP: ptr(true), SSE: ptr(false)},
+			MCPCapabilities:    &schema.McpCapabilities{HTTP: ptr(true), SSE: ptr(true), ACP: ptr(true)},
 			PromptCapabilities: &schema.PromptCapabilities{Image: ptr(true), EmbeddedContext: ptr(true), Audio: ptr(false)},
 			SessionCapabilities: &schema.SessionCapabilities{
 				AdditionalDirectories: &schema.SessionAdditionalDirectoriesCapabilities{},
@@ -337,12 +338,25 @@ func (a *Agent) connectMCP(ctx context.Context, s *session, servers []schema.Mcp
 				headers[h.Name] = h.Value
 			}
 			configs = append(configs, mcp.Config{Name: server.HTTP.Name, HTTP: &mcp.HTTPOptions{URL: server.HTTP.URL, Headers: headers}})
+		case server.SSE != nil:
+			headers := map[string]string{}
+			for _, h := range server.SSE.Headers {
+				headers[h.Name] = h.Value
+			}
+			configs = append(configs, mcp.Config{Name: server.SSE.Name, SSE: &mcp.SSEOptions{URL: server.SSE.URL, Headers: headers}})
+		case server.ACP != nil:
+			configs = append(configs, mcp.Config{Name: server.ACP.Name, ACP: &mcp.ACPOptions{
+				ID:   string(server.ACP.ServerID),
+				Call: a.callMCPMessage,
+			}})
 		}
 	}
 	for name, server := range a.cfg.Get().MCPServers {
 		switch {
 		case server.Command != "":
 			configs = append(configs, mcp.Config{Name: name, Stdio: &mcp.StdioOptions{Command: server.Command, Args: server.Args, Env: server.Env, Dir: s.Cwd}})
+		case server.Transport == "sse":
+			configs = append(configs, mcp.Config{Name: name, SSE: &mcp.SSEOptions{URL: server.URL, Headers: server.Headers}})
 		case server.URL != "":
 			configs = append(configs, mcp.Config{Name: name, HTTP: &mcp.HTTPOptions{URL: server.URL, Headers: server.Headers}})
 		}
@@ -380,6 +394,25 @@ func (a *Agent) connectMCP(ctx context.Context, s *session, servers []schema.Mcp
 		}
 	}
 	return slices.DeleteFunc(clients, func(c *mcp.Client) bool { return c == nil }), notices
+}
+
+// callMCPMessage drives one inner MCP message for a server the client hosts
+// on the ACP connection itself, through the request-scoped mcp/message
+// binding. The client's answer carries either an inner MCP result or an inner
+// MCP error, which never becomes an outer ACP error.
+func (a *Agent) callMCPMessage(ctx context.Context, serverID, requestID, method string, params map[string]any, notify func(method string, params map[string]any)) (json.RawMessage, *mcp.RPCError, error) {
+	outcome, err := a.client.messages.Call(ctx, serverID, requestID, method, params, func(n acpmcp.MessageNotification) error {
+		notify(n.Method, n.Params)
+		return nil
+	})
+	switch {
+	case err != nil:
+		return nil, nil, err
+	case outcome.Error != nil:
+		return nil, &mcp.RPCError{Code: int(outcome.Error.Code), Message: outcome.Error.Message, Data: outcome.Error.Data}, nil
+	default:
+		return outcome.Result, nil, nil
+	}
 }
 
 // mcpToolName maps a server tool to the model-facing name.
