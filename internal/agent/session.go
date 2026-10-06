@@ -36,6 +36,14 @@ type record struct {
 	Plan      []schema.PlanEntry   `json:"plan,omitempty"`
 	// PlanMarkdown is the richer plan document shown beside the entries.
 	PlanMarkdown string `json:"plan_markdown,omitempty"`
+	// Compaction is the summary that replaced the older conversation.
+	Compaction *compactionRecord `json:"compaction,omitempty"`
+}
+
+// compactionRecord is the persisted outcome of one context compaction.
+type compactionRecord struct {
+	ID      schema.CompactionId `json:"id"`
+	Summary string              `json:"summary"`
 }
 
 type session struct {
@@ -52,12 +60,23 @@ type session struct {
 	decisions map[string]bool
 	// deleted stops a still-running turn from re-saving a deleted session.
 	deleted bool
+	// contextUsed and contextSize come from the last model call and the
+	// model's window; 0 until known.
+	contextUsed uint64
+	contextSize uint64
 }
 
 func newSessionID() schema.SessionId {
 	var b [12]byte
 	_, _ = rand.Read(b[:])
 	return schema.SessionId(hex.EncodeToString(b[:]))
+}
+
+// newCompactionID names one compaction in a session.
+func newCompactionID() schema.CompactionId {
+	var b [6]byte
+	_, _ = rand.Read(b[:])
+	return schema.CompactionId(hex.EncodeToString(b[:]))
 }
 
 func (a *Agent) sessionDir() string { return filepath.Join(a.cfg.Dir(), "sessions") }
@@ -395,6 +414,13 @@ func (a *Agent) replay(ctx context.Context, s *session) {
 		for _, update := range a.planUpdates(s.Plan, s.PlanMarkdown, false) {
 			send(update)
 		}
+	}
+	if s.Compaction != nil && a.canCompact() {
+		send(schema.SessionUpdate{CompactionUpdate: &schema.CompactionUpdate{
+			CompactionID: s.Compaction.ID,
+			Status:       schema.CompactionStatusCompleted,
+			Summary:      []schema.ContentBlock{textBlock(s.Compaction.Summary)},
+		}})
 	}
 	results := map[string]openrouter.Message{}
 	for _, m := range s.Messages {

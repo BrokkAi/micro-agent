@@ -26,6 +26,7 @@ var commands = []command{
 	{"login", "Set the OpenRouter API key", "API key (optional; prompts if omitted)"},
 	{"logout", "Remove the stored OpenRouter API key", ""},
 	{"mcp", "List connected MCP servers and their tools", ""},
+	{"compact", "Summarize the conversation to free context", ""},
 	{"clear", "Clear the conversation history of this session", ""},
 }
 
@@ -193,6 +194,7 @@ func (t *turn) command(ctx context.Context, name, args string) (schema.PromptRes
 		t.s.Cost = 0
 		hadPlan := t.s.Plan != nil || t.s.PlanMarkdown != ""
 		t.s.Plan, t.s.PlanMarkdown = nil, ""
+		t.s.Compaction = nil
 		t.s.mu.Unlock()
 		_ = t.a.save(t.s)
 		if hadPlan {
@@ -201,6 +203,16 @@ func (t *turn) command(ctx context.Context, name, args string) (schema.PromptRes
 			}
 		}
 		t.say("Conversation cleared.")
+	case "compact":
+		compacted, err := t.compact(ctx, t.a.modelClient())
+		switch {
+		case err != nil:
+			t.say("Could not compact the conversation: %v", err)
+		case compacted:
+			t.say("Conversation compacted.")
+		default:
+			t.say("Nothing to compact yet.")
+		}
 	}
 	return done, nil
 }

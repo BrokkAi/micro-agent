@@ -116,9 +116,9 @@ func (s *session) begin(ctx context.Context, cancel context.CancelFunc, wait tim
 
 func (t *turn) loop(ctx context.Context) (schema.PromptResponse, error) {
 	cfg := t.a.cfg.Get()
-	_, baseURL, apiKey, headers, _ := t.a.providerSettings()
-	model := &openrouter.Client{BaseURL: baseURL, APIKey: apiKey, Headers: headers}
+	model := t.a.modelClient()
 	for range cfg.MaxTurns {
+		t.maybeCompact(ctx, model)
 		tools := t.tools(ctx)
 		t.s.mu.Lock()
 		request := openrouter.Request{
@@ -329,12 +329,167 @@ func (t *turn) reportUsage(ctx context.Context, model *openrouter.Client, usage 
 	if !ok || info.ContextLength == 0 {
 		return
 	}
+	t.s.mu.Lock()
+	t.s.contextSize = info.ContextLength
+	t.s.contextUsed = usage.PromptTokens + usage.CompletionTokens
+	t.s.mu.Unlock()
 	_ = t.updates.Update(schema.SessionUpdate{UsageUpdate: &schema.UsageUpdate{
 		Used: usage.PromptTokens + usage.CompletionTokens,
 		Size: info.ContextLength,
 		Cost: &schema.Cost{Amount: cost, Currency: "USD"},
 	}})
 }
+
+// compactAt is the share of the model's context window that triggers
+// automatic compaction: 85%.
+const compactAt = 85
+
+// maybeCompact compacts the history once the last model call used most of the
+// model's context window. Failures are advisory; the turn carries on.
+func (t *turn) maybeCompact(ctx context.Context, model *openrouter.Client) {
+	if !t.a.cfg.Get().AutoCompactEnabled() {
+		return
+	}
+	t.s.mu.Lock()
+	used, size := t.s.contextUsed, t.s.contextSize
+	t.s.mu.Unlock()
+	if size <= 0 || used*100 < size*compactAt {
+		return
+	}
+	if _, err := t.compact(ctx, model); err != nil && ctx.Err() == nil {
+		_ = t.updates.Update(t.a.notice(schema.NoticeSeverityWarning, "Compacting the conversation failed", err.Error()))
+	}
+}
+
+// compact replaces the conversation before the last user turn with a summary,
+// so the next request fits the context window. It returns whether it applied
+// a summary, and any summarization error.
+func (t *turn) compact(ctx context.Context, model *openrouter.Client) (bool, error) {
+	t.s.mu.Lock()
+	history := t.s.Messages
+	tail := -1
+	for i := len(history) - 1; i >= 0; i-- {
+		if history[i].Role == "user" {
+			tail = i
+			break
+		}
+	}
+	if tail <= 0 {
+		t.s.mu.Unlock()
+		return false, nil // nothing before the last user turn to summarize
+	}
+	older := append([]openrouter.Message(nil), history[:tail]...)
+	modelID := t.s.Model
+	t.s.mu.Unlock()
+
+	id := newCompactionID()
+	announce := func(update schema.SessionUpdate) { _ = t.updates.Update(update) }
+	if t.a.canCompact() {
+		announce(schema.SessionUpdate{CompactionUpdate: &schema.CompactionUpdate{CompactionID: id, Status: schema.CompactionStatusInProgress}})
+	}
+	failed := func(err error) (bool, error) {
+		if t.a.canCompact() {
+			status := schema.CompactionStatusFailed
+			if ctx.Err() != nil {
+				status = schema.CompactionStatusCancelled
+			}
+			announce(schema.SessionUpdate{CompactionUpdate: &schema.CompactionUpdate{CompactionID: id, Status: status, Error: ptr(err.Error())}})
+		}
+		return false, err
+	}
+
+	var summary strings.Builder
+	result, err := model.Stream(ctx, openrouter.Request{
+		Model: modelID,
+		Messages: []openrouter.Message{
+			{Role: "system", Content: "You summarize coding-agent conversations."},
+			{Role: "user", Content: compactPrompt + transcript(older)},
+		},
+	}, openrouter.Handler{Text: func(delta string) error {
+		summary.WriteString(delta)
+		if t.a.canCompact() {
+			announce(schema.SessionUpdate{CompactionSummaryChunk: &schema.CompactionSummaryChunk{CompactionID: id, Content: textBlock(delta)}})
+		}
+		return nil
+	}})
+	if err != nil {
+		return failed(err)
+	}
+	text := strings.TrimSpace(summary.String())
+	if text == "" {
+		// An unstreamed reply still counts.
+		if content, ok := result.Message.Content.(string); ok {
+			text = strings.TrimSpace(content)
+		}
+	}
+	if text == "" {
+		return failed(errors.New("the model returned an empty summary"))
+	}
+
+	t.s.mu.Lock()
+	t.s.Messages = append([]openrouter.Message{{
+		Role:    "system",
+		Content: "Summary of the earlier conversation (compacted):\n\n" + text,
+	}}, t.s.Messages[tail:]...)
+	t.s.Compaction = &compactionRecord{ID: id, Summary: text}
+	t.s.contextUsed = 0
+	t.s.mu.Unlock()
+	_ = t.a.save(t.s)
+	if t.a.canCompact() {
+		announce(schema.SessionUpdate{CompactionUpdate: &schema.CompactionUpdate{
+			CompactionID: id,
+			Status:       schema.CompactionStatusCompleted,
+			Summary:      []schema.ContentBlock{textBlock(text)},
+		}})
+	}
+	return true, nil
+}
+
+// compactPrompt asks for a summary that lets the work continue.
+const compactPrompt = `The conversation between the system and this message is a coding agent's history that no longer fits the context window. Summarize it for the agent that must continue the work. Keep: the user's requests, decisions made, files and code changed with paths, commands run and their results, errors and how they were resolved, and what is still to do. Reply with the summary only, in Markdown.
+
+--- conversation ---
+`
+
+// transcript renders messages as plain text for compaction, which keeps the
+// summarizer clear of tool-call shapes.
+func transcript(messages []openrouter.Message) string {
+	var b strings.Builder
+	for _, m := range messages {
+		switch content := m.Content.(type) {
+		case string:
+			fmt.Fprintf(&b, "\n%s: %s\n", m.Role, content)
+		case []openrouter.Part:
+			fmt.Fprintf(&b, "\n%s: ", m.Role)
+			for _, part := range content {
+				switch {
+				case part.Text != "":
+					b.WriteString(part.Text)
+				case part.ImageURL != nil:
+					b.WriteString("[image]")
+				}
+			}
+			b.WriteString("\n")
+		}
+		if m.Reasoning != "" {
+			fmt.Fprintf(&b, "(reasoning: %s)\n", m.Reasoning)
+		}
+		for _, call := range m.ToolCalls {
+			fmt.Fprintf(&b, "tool call %s(%s)\n", call.Function.Name, call.Function.Arguments)
+		}
+		if m.ToolCallID != "" {
+			fmt.Fprintf(&b, "tool result %s: %v\n", m.ToolCallID, m.Content)
+		}
+	}
+	text := b.String()
+	if len(text) > maxCompactTranscript {
+		text = "[earlier transcript truncated]\n" + text[len(text)-maxCompactTranscript:]
+	}
+	return text
+}
+
+// maxCompactTranscript bounds what one summarization request carries.
+const maxCompactTranscript = 400 << 10
 
 // systemPrompt must be called with t.s.mu held.
 func (t *turn) systemPrompt() string {

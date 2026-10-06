@@ -19,6 +19,7 @@ import (
 	schema "github.com/BrokkAi/acp-go/schema/unstable"
 	"github.com/BrokkAi/micro-agent/internal/config"
 	"github.com/BrokkAi/micro-agent/internal/mcp"
+	"github.com/BrokkAi/micro-agent/internal/openrouter"
 )
 
 const authMethodID = "openrouter-api-key"
@@ -157,6 +158,16 @@ func (a *Agent) canNotices() bool {
 
 func (a *Agent) canPlan() bool {
 	return a.capable(func(c schema.ClientCapabilities) bool { return c.Plan != nil })
+}
+
+func (a *Agent) canCompact() bool {
+	return a.capable(func(c schema.ClientCapabilities) bool { return c.Session != nil && c.Session.Compaction != nil })
+}
+
+// modelClient returns a client for the session's effective provider.
+func (a *Agent) modelClient() *openrouter.Client {
+	_, baseURL, apiKey, headers, _ := a.providerSettings()
+	return &openrouter.Client{BaseURL: baseURL, APIKey: apiKey, Headers: headers}
 }
 
 // notice builds one user-facing advisory update: a live notice when the
