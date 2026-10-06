@@ -151,6 +151,19 @@ func (a *Agent) canURL() bool {
 	return a.capable(func(c schema.ClientCapabilities) bool { return c.Elicitation != nil && c.Elicitation.URL != nil })
 }
 
+func (a *Agent) canNotices() bool {
+	return a.capable(func(c schema.ClientCapabilities) bool { return c.Session != nil && c.Session.Notices != nil })
+}
+
+// notice builds one user-facing advisory update: a live notice when the
+// client advertises notices, an agent message chunk otherwise.
+func (a *Agent) notice(severity schema.NoticeSeverity, title, description string) schema.SessionUpdate {
+	if a.canNotices() {
+		return schema.SessionUpdate{Notice: &schema.Notice{Severity: severity, Title: title, Description: ptr(description)}}
+	}
+	return schema.SessionUpdate{AgentMessageChunk: &schema.ContentChunk{Content: textBlock("⚠️ " + title + ": " + description + "\n\n")}}
+}
+
 // Providers.
 
 // providerSettings returns the effective LLM routing: what the client set
@@ -419,9 +432,15 @@ func (a *Agent) setEffort(s *session, effort string) error {
 
 var unsafeName = regexp.MustCompile(`[^a-zA-Z0-9_-]+`)
 
+// mcpFailure is one configured MCP server that could not connect.
+type mcpFailure struct {
+	name string
+	err  error
+}
+
 // connectMCP connects the client-provided and globally configured servers
-// concurrently. Failed servers are skipped, with a notice for the user.
-func (a *Agent) connectMCP(ctx context.Context, s *session, servers []schema.McpServer) ([]*mcp.Client, []schema.SessionUpdate) {
+// concurrently. Failed servers are skipped, with a failure for the user.
+func (a *Agent) connectMCP(ctx context.Context, s *session, servers []schema.McpServer) ([]*mcp.Client, []mcpFailure) {
 	var configs []mcp.Config
 	for _, server := range servers {
 		switch {
@@ -462,7 +481,7 @@ func (a *Agent) connectMCP(ctx context.Context, s *session, servers []schema.Mcp
 	}
 	info := mcp.ClientInfo{Name: "micro-agent", Version: a.version, Roots: append([]string{s.Cwd}, s.Dirs...)}
 	clients := make([]*mcp.Client, len(configs))
-	failures := make([]error, len(configs))
+	errs := make([]error, len(configs))
 	var wg sync.WaitGroup
 	for i, c := range configs {
 		wg.Go(func() {
@@ -477,22 +496,20 @@ func (a *Agent) connectMCP(ctx context.Context, s *session, servers []schema.Mcp
 					_ = connected.Close()
 				}
 				fmt.Fprintf(os.Stderr, "micro-agent: MCP server %s: %v\n", c.Name, err)
-				failures[i] = err
+				errs[i] = err
 				return
 			}
 			clients[i] = connected
 		})
 	}
 	wg.Wait()
-	var notices []schema.SessionUpdate
-	for i, err := range failures {
+	var failures []mcpFailure
+	for i, err := range errs {
 		if err != nil {
-			notices = append(notices, schema.SessionUpdate{AgentMessageChunk: &schema.ContentChunk{
-				Content: textBlock(fmt.Sprintf("⚠️ MCP server `%s` failed to start: %v\n\n", configs[i].Name, err)),
-			}})
+			failures = append(failures, mcpFailure{name: configs[i].Name, err: err})
 		}
 	}
-	return slices.DeleteFunc(clients, func(c *mcp.Client) bool { return c == nil }), notices
+	return slices.DeleteFunc(clients, func(c *mcp.Client) bool { return c == nil }), failures
 }
 
 // callMCPMessage drives one inner MCP message for a server the client hosts

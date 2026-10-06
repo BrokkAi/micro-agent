@@ -125,7 +125,11 @@ func (a *Agent) lookup(id schema.SessionId) (*session, error) {
 func (a *Agent) open(ctx context.Context, s *session, servers []schema.McpServer) []schema.SessionUpdate {
 	s.decisions = map[string]bool{}
 	var notices []schema.SessionUpdate
-	s.servers, notices = a.connectMCP(ctx, s, servers)
+	var failures []mcpFailure
+	s.servers, failures = a.connectMCP(ctx, s, servers)
+	for _, failure := range failures {
+		notices = append(notices, a.notice(schema.NoticeSeverityWarning, fmt.Sprintf("MCP server `%s` failed to start", failure.name), failure.err.Error()))
+	}
 	a.mu.Lock()
 	if old := a.sessions[s.ID]; old != nil {
 		a.shutdown(old)

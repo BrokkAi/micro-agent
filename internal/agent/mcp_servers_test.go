@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
@@ -142,5 +143,31 @@ func TestSessionConnectsClientACPServers(t *testing.T) {
 	result := last[len(last)-1].(map[string]any)
 	if result["role"] != "tool" || !strings.Contains(result["content"].(string), "acp says hi") {
 		t.Fatalf("tool result = %v", result)
+	}
+}
+
+func TestMCPFailuresUseNoticesWhenAdvertised(t *testing.T) {
+	h := newHarness(t, schema.ClientCapabilities{Session: &schema.ClientSessionCapabilities{Notices: &schema.NoticeCapabilities{}}})
+	broken := schema.McpServer{Stdio: &schema.McpServerStdio{Name: "broken", Command: filepath.Join(t.TempDir(), "missing"), Args: []string{}, Env: []schema.EnvVariable{}}}
+	if _, err := send[schema.NewSessionResponse](h, schema.SessionNewMethodName, schema.NewSessionRequest{Cwd: h.dir, MCPServers: []schema.McpServer{broken}}); err != nil {
+		t.Fatal(err)
+	}
+	// A later call pushes the frame order, so the queued updates are in.
+	if _, err := send[schema.ListSessionsResponse](h, schema.SessionListMethodName, schema.ListSessionsRequest{}); err != nil {
+		t.Fatal(err)
+	}
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	var notice *schema.Notice
+	for _, n := range h.updates {
+		if n.Update.AgentMessageChunk != nil {
+			t.Fatal("MCP failure sent as an agent message chunk")
+		}
+		if n.Update.Notice != nil {
+			notice = n.Update.Notice
+		}
+	}
+	if notice == nil || notice.Severity != schema.NoticeSeverityWarning || !strings.Contains(notice.Title, "`broken`") {
+		t.Fatalf("notice = %+v", notice)
 	}
 }
