@@ -42,7 +42,10 @@ func (v *V2) Initialize(_ context.Context, _ agent2.Client, request schema2.Init
 		}})
 	}
 	v.a.mu.Lock()
-	v.a.caps = schema1.ClientCapabilities{}
+	// Draft v2 always supports boolean config options.
+	v.a.caps = schema1.ClientCapabilities{Session: &schema1.ClientSessionCapabilities{
+		ConfigOptions: &schema1.SessionConfigOptionsCapabilities{Boolean: &schema1.BooleanConfigOptionCapabilities{}},
+	}}
 	if caps != nil {
 		if caps.Elicitation != nil {
 			elicitation := &schema1.ElicitationCapabilities{}
@@ -258,12 +261,17 @@ func (v *V2) SetConfigOption(ctx context.Context, client agent2.Client, request 
 	if err != nil {
 		return schema2.SetSessionConfigOptionResponse{}, err
 	}
-	if request.ID == nil {
-		return schema2.SetSessionConfigOptionResponse{}, invalidParams("option " + string(request.ConfigID) + " takes a select value")
+	var value *schema1.SessionConfigValueId
+	if request.ID != nil {
+		choice := schema1.SessionConfigValueId(request.ID.Value)
+		value = &choice
 	}
-	value := schema1.SessionConfigValueId(request.ID.Value)
+	var boolean *bool
+	if request.Boolean != nil {
+		boolean = &request.Boolean.Value
+	}
 	sink := newV2Sink(v2Sender{ctx: ctx, client: client, session: request.SessionID})
-	if err := v.a.setConfigOption(s, schema1.SessionConfigId(request.ConfigID), &value, sink); err != nil {
+	if err := v.a.setConfigOption(s, schema1.SessionConfigId(request.ConfigID), value, boolean, sink); err != nil {
 		return schema2.SetSessionConfigOptionResponse{}, err
 	}
 	options, err := v2ConfigOptions(v.a.configOptions(s))

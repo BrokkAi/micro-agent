@@ -185,6 +185,12 @@ func (a *Agent) canCompact() bool {
 	return a.capable(func(c schema.ClientCapabilities) bool { return c.Session != nil && c.Session.Compaction != nil })
 }
 
+func (a *Agent) canBooleanConfig() bool {
+	return a.capable(func(c schema.ClientCapabilities) bool {
+		return c.Session != nil && c.Session.ConfigOptions != nil && c.Session.ConfigOptions.Boolean != nil
+	})
+}
+
 // modelClient returns a client for the session's effective provider.
 func (a *Agent) modelClient() *openrouter.Client {
 	_, baseURL, apiKey, headers, _ := a.providerSettings()
@@ -366,7 +372,7 @@ func (a *Agent) configOptions(s *session) []schema.SessionConfigOption {
 		effort = defaultEffort
 	}
 	category := func(c schema.SessionConfigOptionCategory) *schema.SessionConfigOptionCategory { return &c }
-	return []schema.SessionConfigOption{
+	options := []schema.SessionConfigOption{
 		{ID: "mode", Name: "Mode", Category: category(schema.SessionConfigOptionCategoryMode),
 			Select: &schema.SessionConfigSelect{CurrentValue: schema.SessionConfigValueId(current), Options: modeOptions}},
 		{ID: "model", Name: "Model", Category: category(schema.SessionConfigOptionCategoryModel),
@@ -374,6 +380,11 @@ func (a *Agent) configOptions(s *session) []schema.SessionConfigOption {
 		{ID: "reasoning_effort", Name: "Reasoning effort", Category: category(schema.SessionConfigOptionCategoryThoughtLevel),
 			Select: &schema.SessionConfigSelect{CurrentValue: schema.SessionConfigValueId(effort), Options: effortOptions}},
 	}
+	if a.canBooleanConfig() {
+		options = append(options, schema.SessionConfigOption{ID: "auto_compact", Name: "Auto compact",
+			Boolean: &schema.SessionConfigBoolean{CurrentValue: cfg.AutoCompactEnabled()}})
+	}
+	return options
 }
 
 // modelOptions groups model slugs by vendor, the part before '/', once there
@@ -407,8 +418,16 @@ func (a *Agent) SetConfigOption(ctx context.Context, request schema.SetSessionCo
 	if err != nil {
 		return schema.SetSessionConfigOptionResponse{}, err
 	}
+	var value *schema.SessionConfigValueId
+	if request.ValueID != nil {
+		value = &request.ValueID.Value
+	}
+	var boolean *bool
+	if request.Boolean != nil {
+		boolean = &request.Boolean.Value
+	}
 	updates := updater{a: a, id: s.ID}
-	if err := a.setConfigOption(s, request.ConfigID, &request.ValueID.Value, updates); err != nil {
+	if err := a.setConfigOption(s, request.ConfigID, value, boolean, updates); err != nil {
 		return schema.SetSessionConfigOptionResponse{}, err
 	}
 	return schema.SetSessionConfigOptionResponse{ConfigOptions: a.configOptions(s)}, nil
@@ -416,7 +435,19 @@ func (a *Agent) SetConfigOption(ctx context.Context, request schema.SetSessionCo
 
 // setConfigOption applies one config option change, shared by the v1 request
 // and the draft-v2 facade.
-func (a *Agent) setConfigOption(s *session, id schema.SessionConfigId, value *schema.SessionConfigValueId, updates updateSink) error {
+func (a *Agent) setConfigOption(s *session, id schema.SessionConfigId, value *schema.SessionConfigValueId, boolean *bool, updates updateSink) error {
+	if boolean != nil || id == "auto_compact" {
+		if id != "auto_compact" {
+			return invalidParams("option " + string(id) + " takes a select value")
+		}
+		if boolean == nil {
+			return invalidParams("option auto_compact takes a boolean value")
+		}
+		if err := a.cfg.Update(func(c *config.Config) error { c.AutoCompact = boolean; return nil }); err != nil {
+			return err
+		}
+		return updates.Update(schema.SessionUpdate{ConfigOptionUpdate: &schema.ConfigOptionUpdate{ConfigOptions: a.configOptions(s)}})
+	}
 	if value == nil {
 		return invalidParams("option " + string(id) + " takes a select value")
 	}
