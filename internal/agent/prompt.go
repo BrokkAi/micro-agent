@@ -37,7 +37,10 @@ func (a *Agent) Prompt(parent context.Context, request schema.PromptRequest) (sc
 	if name, args, ok := parseCommand(request.Prompt); ok {
 		return t.command(ctx, name, args)
 	}
-	if a.cfg.Get().APIKey == "" {
+	if _, _, _, _, disabled := a.providerSettings(); disabled {
+		return schema.PromptResponse{}, &acp.RPCError{Code: int(schema.ErrorCodeInvalidRequest), Message: "provider " + providerID + " is disabled; configure it with providers/set first"}
+	}
+	if !a.credentialed() {
 		if !t.login(ctx, "") {
 			if ctx.Err() != nil {
 				return schema.PromptResponse{StopReason: schema.StopReasonCancelled}, nil
@@ -113,7 +116,8 @@ func (s *session) begin(ctx context.Context, cancel context.CancelFunc, wait tim
 
 func (t *turn) loop(ctx context.Context) (schema.PromptResponse, error) {
 	cfg := t.a.cfg.Get()
-	model := &openrouter.Client{BaseURL: cfg.BaseURL, APIKey: cfg.APIKey}
+	_, baseURL, apiKey, headers, _ := t.a.providerSettings()
+	model := &openrouter.Client{BaseURL: baseURL, APIKey: apiKey, Headers: headers}
 	for range cfg.MaxTurns {
 		tools := t.tools(ctx)
 		t.s.mu.Lock()

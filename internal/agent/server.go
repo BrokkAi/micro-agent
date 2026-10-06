@@ -161,6 +161,12 @@ func (a *Agent) dispatch(ctx context.Context, method string, raw json.RawMessage
 		return handle(ctx, raw, a.SetConfigOption)
 	case schema.LogoutMethodName:
 		return handle(ctx, raw, a.Logout)
+	case schema.ProvidersListMethodName:
+		return handle(ctx, raw, a.ListProviders)
+	case schema.ProvidersSetMethodName:
+		return handle(ctx, raw, a.SetProvider)
+	case schema.ProvidersDisableMethodName:
+		return handle(ctx, raw, a.DisableProvider)
 	}
 	return nil, methodNotFound(method)
 }

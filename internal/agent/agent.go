@@ -6,6 +6,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"net/url"
 	"os"
 	"regexp"
 	"slices"
@@ -32,6 +33,22 @@ type Agent struct {
 	sessions map[schema.SessionId]*session
 	caps     schema.ClientCapabilities
 	offered  *schema.AgentCapabilities // nil until initialize succeeds
+	// provider is the LLM routing a client set with providers/set. It is
+	// process-scoped: nothing here is written to the config file.
+	provider providerConfig
+}
+
+// providerID names the one LLM provider micro-agent offers. Any
+// OpenAI-compatible base URL is accepted, so clients can point it at a
+// gateway or a local server.
+const providerID = "main"
+
+type providerConfig struct {
+	set      bool
+	apiType  schema.LlmProtocol
+	baseURL  string
+	headers  map[string]string
+	disabled bool
 }
 
 // New returns an agent backed by the given configuration.
@@ -72,7 +89,8 @@ func (a *Agent) Initialize(_ context.Context, request schema.InitializeRequest) 
 				List:                  &schema.SessionListCapabilities{},
 				Resume:                &schema.SessionResumeCapabilities{},
 			},
-			Auth: &schema.AgentAuthCapabilities{Logout: &schema.LogoutCapabilities{}},
+			Auth:      &schema.AgentAuthCapabilities{Logout: &schema.LogoutCapabilities{}},
+			Providers: &schema.ProvidersCapabilities{},
 		},
 	}
 	a.mu.Lock()
@@ -88,7 +106,7 @@ func (a *Agent) Authenticate(_ context.Context, request schema.AuthenticateReque
 	if request.MethodID != authMethodID {
 		return schema.AuthenticateResponse{}, invalidParams("unknown auth method " + string(request.MethodID))
 	}
-	if a.cfg.Get().APIKey == "" {
+	if !a.credentialed() {
 		return schema.AuthenticateResponse{}, authRequired()
 	}
 	return schema.AuthenticateResponse{}, nil
@@ -131,6 +149,86 @@ func (a *Agent) canForm() bool {
 
 func (a *Agent) canURL() bool {
 	return a.capable(func(c schema.ClientCapabilities) bool { return c.Elicitation != nil && c.Elicitation.URL != nil })
+}
+
+// Providers.
+
+// providerSettings returns the effective LLM routing: what the client set
+// with providers/set, or the configuration file's default. A client-set
+// provider carries its own credentials in its headers, so the stored API key
+// is not attached to another endpoint.
+func (a *Agent) providerSettings() (apiType schema.LlmProtocol, baseURL, apiKey string, headers map[string]string, disabled bool) {
+	cfg := a.cfg.Get()
+	apiType, baseURL, apiKey = schema.LlmProtocolOpenai, cfg.BaseURL, cfg.APIKey
+	a.mu.Lock()
+	p := a.provider
+	a.mu.Unlock()
+	if p.set {
+		apiType, baseURL, apiKey, headers = p.apiType, p.baseURL, "", p.headers
+	}
+	return apiType, baseURL, apiKey, headers, p.disabled
+}
+
+// credentialed reports whether an LLM call can authenticate: a stored key
+// for the default provider, or the client's own Authorization header.
+func (a *Agent) credentialed() bool {
+	a.mu.Lock()
+	p := a.provider
+	a.mu.Unlock()
+	if !p.set && a.cfg.Get().APIKey != "" {
+		return true
+	}
+	for name, value := range p.headers {
+		if strings.EqualFold(name, "Authorization") && strings.TrimSpace(value) != "" {
+			return true
+		}
+	}
+	return false
+}
+
+func (a *Agent) ListProviders(context.Context, schema.ListProvidersRequest) (schema.ListProvidersResponse, error) {
+	apiType, baseURL, _, _, disabled := a.providerSettings()
+	info := schema.ProviderInfo{ProviderID: providerID, Supported: []schema.LlmProtocol{schema.LlmProtocolOpenai}}
+	if !disabled {
+		info.Current = &schema.ProviderCurrentConfig{APIType: apiType, BaseURL: baseURL}
+	}
+	return schema.ListProvidersResponse{Providers: []schema.ProviderInfo{info}}, nil
+}
+
+func (a *Agent) SetProvider(_ context.Context, request schema.SetProviderRequest) (schema.SetProviderResponse, error) {
+	if string(request.ProviderID) != providerID {
+		return schema.SetProviderResponse{}, invalidParams("unknown provider " + string(request.ProviderID))
+	}
+	if request.APIType != schema.LlmProtocolOpenai {
+		return schema.SetProviderResponse{}, invalidParams("provider " + providerID + " speaks the openai protocol, not " + string(request.APIType))
+	}
+	baseURL, err := providerBaseURL(request.BaseURL)
+	if err != nil {
+		return schema.SetProviderResponse{}, err
+	}
+	a.mu.Lock()
+	a.provider = providerConfig{set: true, apiType: request.APIType, baseURL: baseURL, headers: request.Headers}
+	a.mu.Unlock()
+	return schema.SetProviderResponse{}, nil
+}
+
+func (a *Agent) DisableProvider(_ context.Context, request schema.DisableProviderRequest) (schema.DisableProviderResponse, error) {
+	if string(request.ProviderID) != providerID {
+		return schema.DisableProviderResponse{}, nil // an unknown provider is already off
+	}
+	a.mu.Lock()
+	a.provider.disabled = true
+	a.mu.Unlock()
+	return schema.DisableProviderResponse{}, nil
+}
+
+// providerBaseURL validates a base URL from providers/set.
+func providerBaseURL(raw string) (string, error) {
+	parsed, err := url.Parse(strings.TrimSpace(raw))
+	if err != nil || parsed.Host == "" || (parsed.Scheme != "http" && parsed.Scheme != "https") {
+		return "", invalidParams("baseUrl must be an absolute http(s) URL")
+	}
+	return strings.TrimRight(parsed.String(), "/"), nil
 }
 
 // Modes.

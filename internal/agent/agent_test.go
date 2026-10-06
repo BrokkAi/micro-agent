@@ -26,6 +26,7 @@ type fakeRouter struct {
 	mu        sync.Mutex
 	responses [][]string
 	requests  []map[string]any
+	headers   []http.Header
 }
 
 func (f *fakeRouter) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -37,6 +38,7 @@ func (f *fakeRouter) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	_ = json.NewDecoder(r.Body).Decode(&body)
 	f.mu.Lock()
 	f.requests = append(f.requests, body)
+	f.headers = append(f.headers, r.Header.Clone())
 	var chunks []string
 	if len(f.responses) > 0 {
 		chunks, f.responses = f.responses[0], f.responses[1:]

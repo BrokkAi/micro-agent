@@ -94,11 +94,11 @@ func TestMethodGating(t *testing.T) {
 	if h.init.AgentCapabilities.SessionCapabilities.Fork == nil {
 		t.Fatal("fork not advertised")
 	}
-	if h.init.AgentCapabilities.Providers != nil {
-		t.Fatal("providers advertised")
+	if h.init.AgentCapabilities.Providers == nil {
+		t.Fatal("providers not advertised")
 	}
-	if _, err := send[json.RawMessage](h, schema.ProvidersListMethodName, schema.ListProvidersRequest{}); rpcCode(err) != -32601 {
-		t.Errorf("providers/list: %v", err)
+	if list, err := send[schema.ListProvidersResponse](h, schema.ProvidersListMethodName, schema.ListProvidersRequest{}); err != nil || len(list.Providers) != 1 {
+		t.Errorf("providers/list = %+v, %v", list, err)
 	}
 	fork := schema.ForkSessionRequest{SessionID: "abc", Cwd: h.dir, MCPServers: []schema.McpServer{}}
 	if _, err := send[json.RawMessage](h, schema.SessionForkMethodName, fork); rpcCode(err) != int(schema.ErrorCodeResourceNotFound) {
