@@ -5,12 +5,16 @@ A minimal [Agent Client Protocol](https://agentclientprotocol.com) coding agent 
 **Tools:** `shell`, `read_file`, `edit_file`, `write_file`, `update_plan`, plus every tool from connected MCP servers (stdio, streamable HTTP, legacy HTTP+SSE, and servers the client hosts on the ACP connection itself).
 
 ```sh
-go install github.com/BrokkAi/micro-agent@latest
+npx @brokkai/micro-agent  # or: npm install -g @brokkai/micro-agent
+go install github.com/BrokkAi/micro-agent@latest   # or build from source
 micro-agent login        # or set OPENROUTER_API_KEY, or use /login in your editor
 ```
 
 Release binaries for Linux, macOS and Windows (amd64 and arm64) with
 checksums are on the [releases page](https://github.com/BrokkAi/micro-agent/releases).
+The npm package bundles the native binary for the current platform as an
+optional dependency, so the `micro-agent` command (or `npx @brokkai/micro-agent`)
+can be used directly as an ACP agent.
 
 Point your ACP client (Zed, etc.) at the `micro-agent` binary.
 
@@ -64,6 +68,11 @@ If the project has an `AGENTS.md`, it is added to the system prompt.
 Pushing a `v*` tag runs the CI matrix (Linux, macOS, Windows), the license
 checks, and a GoReleaser snapshot, then publishes versioned archives plus
 `checksums.txt`. GoReleaser injects the tag into `micro-agent -version`.
+
+The same tag publishes `@brokkai/micro-agent` and its per-platform packages to
+npm with provenance from the release archives. The first publish of a new
+package needs a token; after that, npm's trusted publisher for this workflow
+handles releases without a stored secret.
 
 ## License
 

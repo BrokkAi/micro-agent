@@ -1,0 +1,53 @@
+name: Publish npm packages
+
+on:
+  workflow_call:
+    inputs:
+      tag:
+        description: Release tag to publish, for example v0.1.0
+        type: string
+        required: true
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Release tag to publish, for example v0.1.0
+        type: string
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  publish:
+    name: Publish @brokkai/micro-agent
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    environment: packages-publish
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      RELEASE_TAG: ${{ inputs.tag }}
+      # Empty unless the repository or packages-publish environment defines it;
+      # npm falls back to OIDC trusted publishing when no token is present.
+      NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          ref: ${{ inputs.tag }}
+          persist-credentials: false
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: '24'
+          registry-url: https://registry.npmjs.org
+          package-manager-cache: false
+      - name: Download the release archives
+        run: gh release download "$RELEASE_TAG" --dir dist/release --pattern 'micro-agent_*' --pattern 'checksums.txt'
+      - name: Build and publish the npm packages
+        run: |
+          python3 scripts/npm_packages.py \
+            --version "${RELEASE_TAG#v}" \
+            --assets dist/release \
+            --out dist/npm \
+            --publish --provenance

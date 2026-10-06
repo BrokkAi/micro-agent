@@ -1,5 +1,7 @@
 /micro-agent
 /micro-agent.exe
 /dist/
+/dist-npm/
 /bin/
+__pycache__/
 *.test

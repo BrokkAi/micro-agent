@@ -94,3 +94,25 @@ jobs:
           test -s dist/smoke/NOTICE
           test -s dist/smoke/licenses/THIRD_PARTY_NOTICES.txt
           ./dist/smoke/micro-agent --version
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: '24'
+          package-manager-cache: false
+      - name: Build and smoke-test the npm packages
+        run: |
+          version=$(python3 -c "import json; print(json.load(open('dist/metadata.json'))['version'])")
+          python3 scripts/npm_packages.py --version "$version" --assets dist --out dist-npm
+          mkdir -p dist-npm/smoke
+          cd dist-npm/smoke
+          npm init -y >/dev/null
+          npm install --no-save --ignore-scripts \
+            "../brokkai-micro-agent-linux-x64-${version}.tgz" "../brokkai-micro-agent-${version}.tgz"
+          test "$(./node_modules/.bin/micro-agent --version)" = "$version"
+          printf '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":1,"clientCapabilities":{},"clientInfo":{"name":"ci","version":"1"}}}\n' \
+            | ./node_modules/.bin/micro-agent -config smoke-config.json > initialize.json
+          python3 - <<'PY'
+          import json
+
+          result = json.load(open("initialize.json"))
+          assert result["result"]["protocolVersion"] == 1, result
+          PY
