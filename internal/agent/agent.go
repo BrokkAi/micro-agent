@@ -319,7 +319,7 @@ func (a *Agent) SetMode(ctx context.Context, request schema.SetSessionModeReques
 	if err != nil {
 		return schema.SetSessionModeResponse{}, err
 	}
-	if err := a.setMode(ctx, s, string(request.ModeID), false); err != nil {
+	if err := a.setMode(s, string(request.ModeID), false, updater{a: a, id: s.ID}); err != nil {
 		return schema.SetSessionModeResponse{}, err
 	}
 	return schema.SetSessionModeResponse{}, nil
@@ -328,7 +328,7 @@ func (a *Agent) SetMode(ctx context.Context, request schema.SetSessionModeReques
 // setMode switches the session mode and keeps the mode config option in sync.
 // announceMode also emits current_mode_update, for changes the client did not
 // initiate.
-func (a *Agent) setMode(ctx context.Context, s *session, id string, announceMode bool) error {
+func (a *Agent) setMode(s *session, id string, announceMode bool, updates updateSink) error {
 	if validMode(id) != id {
 		return invalidParams("unknown mode " + id)
 	}
@@ -337,9 +337,9 @@ func (a *Agent) setMode(ctx context.Context, s *session, id string, announceMode
 	s.mu.Unlock()
 	_ = a.save(s)
 	if announceMode {
-		_ = a.notify(ctx, s.ID, schema.SessionUpdate{CurrentModeUpdate: &schema.CurrentModeUpdate{CurrentModeID: schema.SessionModeId(id)}})
+		_ = updates.Update(schema.SessionUpdate{CurrentModeUpdate: &schema.CurrentModeUpdate{CurrentModeID: schema.SessionModeId(id)}})
 	}
-	return a.notify(ctx, s.ID, schema.SessionUpdate{ConfigOptionUpdate: &schema.ConfigOptionUpdate{ConfigOptions: a.configOptions(s)}})
+	return updates.Update(schema.SessionUpdate{ConfigOptionUpdate: &schema.ConfigOptionUpdate{ConfigOptions: a.configOptions(s)}})
 }
 
 // Config options.
@@ -406,32 +406,42 @@ func (a *Agent) SetConfigOption(ctx context.Context, request schema.SetSessionCo
 	if err != nil {
 		return schema.SetSessionConfigOptionResponse{}, err
 	}
-	if request.ValueID == nil {
-		return schema.SetSessionConfigOptionResponse{}, invalidParams("option " + string(request.ConfigID) + " takes a select value")
+	updates := updater{a: a, id: s.ID}
+	if err := a.setConfigOption(s, request.ConfigID, &request.ValueID.Value, updates); err != nil {
+		return schema.SetSessionConfigOptionResponse{}, err
 	}
-	value := string(request.ValueID.Value)
-	switch request.ConfigID {
+	return schema.SetSessionConfigOptionResponse{ConfigOptions: a.configOptions(s)}, nil
+}
+
+// setConfigOption applies one config option change, shared by the v1 request
+// and the draft-v2 facade.
+func (a *Agent) setConfigOption(s *session, id schema.SessionConfigId, value *schema.SessionConfigValueId, updates updateSink) error {
+	if value == nil {
+		return invalidParams("option " + string(id) + " takes a select value")
+	}
+	choice := string(*value)
+	switch id {
 	case "mode":
-		if validMode(value) != value {
-			return schema.SetSessionConfigOptionResponse{}, invalidParams("unknown mode " + value)
+		if validMode(choice) != choice {
+			return invalidParams("unknown mode " + choice)
 		}
 		s.mu.Lock()
-		s.Mode = value
+		s.Mode = choice
 		s.mu.Unlock()
-		_ = a.notify(ctx, s.ID, schema.SessionUpdate{CurrentModeUpdate: &schema.CurrentModeUpdate{CurrentModeID: schema.SessionModeId(value)}})
+		_ = updates.Update(schema.SessionUpdate{CurrentModeUpdate: &schema.CurrentModeUpdate{CurrentModeID: schema.SessionModeId(choice)}})
 	case "model":
-		if err := a.setModel(s, value); err != nil {
-			return schema.SetSessionConfigOptionResponse{}, err
+		if err := a.setModel(s, choice); err != nil {
+			return err
 		}
 	case "reasoning_effort":
-		if err := a.setEffort(s, value); err != nil {
-			return schema.SetSessionConfigOptionResponse{}, err
+		if err := a.setEffort(s, choice); err != nil {
+			return err
 		}
 	default:
-		return schema.SetSessionConfigOptionResponse{}, invalidParams("unknown config option " + string(request.ConfigID))
+		return invalidParams("unknown config option " + string(id))
 	}
 	_ = a.save(s)
-	return schema.SetSessionConfigOptionResponse{ConfigOptions: a.configOptions(s)}, nil
+	return updates.Update(schema.SessionUpdate{ConfigOptionUpdate: &schema.ConfigOptionUpdate{ConfigOptions: a.configOptions(s)}})
 }
 
 // setModel switches the session model and makes it the default for new sessions.

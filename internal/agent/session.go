@@ -483,7 +483,7 @@ func (a *Agent) replay(ctx context.Context, s *session) {
 }
 
 // announce publishes the command list, title and MCP notices for a session.
-func (a *Agent) announce(s *session, notices []schema.SessionUpdate, updates updater) {
+func (a *Agent) announce(s *session, notices []schema.SessionUpdate, updates updateSink) {
 	_ = updates.Update(schema.SessionUpdate{AvailableCommandsUpdate: &schema.AvailableCommandsUpdate{AvailableCommands: commandList()}})
 	if s.Title != "" {
 		_ = updates.Update(schema.SessionUpdate{SessionInfoUpdate: &schema.SessionInfoUpdate{Title: ptr(s.Title)}})

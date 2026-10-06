@@ -56,8 +56,8 @@ func failure(format string, args ...any) toolResult {
 type turn struct {
 	a       *Agent
 	s       *session
-	client  *clientConn
-	updates updater
+	client  host
+	updates updateSink
 	mcp     map[string]mcpBinding
 }
 

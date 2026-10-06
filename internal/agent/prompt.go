@@ -33,8 +33,14 @@ func (a *Agent) Prompt(parent context.Context, request schema.PromptRequest) (sc
 	defer end()
 
 	updates := updater{a: a, id: s.ID}
-	t := &turn{a: a, s: s, client: a.client, updates: updates}
-	if name, args, ok := parseCommand(request.Prompt); ok {
+	return a.runTurn(ctx, s, request.Prompt, a.client, updates)
+}
+
+// runTurn runs one prompt to completion with the given editor host and update
+// sink. ctx must come from s.begin.
+func (a *Agent) runTurn(ctx context.Context, s *session, prompt []schema.ContentBlock, host host, updates updateSink) (schema.PromptResponse, error) {
+	t := &turn{a: a, s: s, client: host, updates: updates}
+	if name, args, ok := parseCommand(prompt); ok {
 		return t.command(ctx, name, args)
 	}
 	if _, _, _, _, disabled := a.providerSettings(); disabled {
@@ -50,10 +56,10 @@ func (a *Agent) Prompt(parent context.Context, request schema.PromptRequest) (sc
 	}
 
 	s.mu.Lock()
-	s.Messages = append(s.Messages, userMessage(request.Prompt))
+	s.Messages = append(s.Messages, userMessage(prompt))
 	setTitle := s.Title == ""
 	if setTitle {
-		s.Title = title(request.Prompt)
+		s.Title = title(prompt)
 	}
 	s.mu.Unlock()
 	if setTitle && s.Title != "" {

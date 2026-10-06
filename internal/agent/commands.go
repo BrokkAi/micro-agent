@@ -113,7 +113,7 @@ func (t *turn) command(ctx context.Context, name, args string) (schema.PromptRes
 			t.say("%s", b.String())
 			return done, nil
 		}
-		if err := t.a.setMode(ctx, t.s, args, true); err != nil {
+		if err := t.a.setMode(t.s, args, true, t.updates); err != nil {
 			t.say("%v", err)
 			return done, nil
 		}
