@@ -439,6 +439,12 @@ func (a *Agent) replay(ctx context.Context, s *session) {
 					if mime, data, ok := parseDataURL(part.ImageURL.URL); ok {
 						send(schema.SessionUpdate{UserMessageChunk: &schema.ContentChunk{Content: schema.ContentBlock{Image: &schema.ImageContent{MimeType: mime, Data: data}}}})
 					}
+				case part.InputAudio != nil:
+					mime := "audio/" + part.InputAudio.Format
+					if part.InputAudio.Format == "mp3" {
+						mime = "audio/mpeg"
+					}
+					send(schema.SessionUpdate{UserMessageChunk: &schema.ContentChunk{Content: schema.ContentBlock{Audio: &schema.AudioContent{MimeType: mime, Data: part.InputAudio.Data}}}})
 				}
 			}
 		case "assistant":

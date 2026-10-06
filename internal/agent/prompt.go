@@ -530,18 +530,25 @@ You have five tools: shell, read_file, edit_file, write_file and update_plan, pl
 // userMessage converts ACP prompt blocks to an OpenRouter user message.
 func userMessage(blocks []schema.ContentBlock) openrouter.Message {
 	var parts []openrouter.Part
-	hasImage := false
+	structured := false
 	for _, block := range blocks {
 		switch {
 		case block.Text != nil:
 			parts = append(parts, openrouter.Part{Type: "text", Text: block.Text.Text})
 		case block.Image != nil:
-			hasImage = true
+			structured = true
 			url := "data:" + block.Image.MimeType + ";base64," + block.Image.Data
 			if block.Image.Data == "" && block.Image.URI != nil {
 				url = *block.Image.URI
 			}
 			parts = append(parts, openrouter.Part{Type: "image_url", ImageURL: &openrouter.ImageURL{URL: url}})
+		case block.Audio != nil:
+			structured = true
+			if format, ok := audioFormat(block.Audio.MimeType); ok {
+				parts = append(parts, openrouter.Part{Type: "input_audio", InputAudio: &openrouter.InputAudio{Data: block.Audio.Data, Format: format}})
+			} else {
+				parts = append(parts, openrouter.Part{Type: "text", Text: fmt.Sprintf("[Attached audio in unsupported format %s]", block.Audio.MimeType)})
+			}
 		case block.ResourceLink != nil:
 			parts = append(parts, openrouter.Part{Type: "text", Text: fmt.Sprintf("[Referenced: %s (%s)]", block.ResourceLink.Name, uriPath(block.ResourceLink.URI))})
 		case block.Resource != nil:
@@ -552,7 +559,7 @@ func userMessage(blocks []schema.ContentBlock) openrouter.Message {
 			}
 		}
 	}
-	if !hasImage {
+	if !structured {
 		var texts []string
 		for _, part := range parts {
 			texts = append(texts, part.Text)
@@ -560,6 +567,18 @@ func userMessage(blocks []schema.ContentBlock) openrouter.Message {
 		return openrouter.Message{Role: "user", Content: strings.Join(texts, "\n")}
 	}
 	return openrouter.Message{Role: "user", Content: parts}
+}
+
+// audioFormat maps an ACP audio MIME type to the codec name OpenRouter's
+// input_audio part takes; only wav and mp3 are accepted.
+func audioFormat(mimeType string) (string, bool) {
+	switch strings.ToLower(strings.TrimSpace(mimeType)) {
+	case "audio/wav", "audio/x-wav", "audio/wave":
+		return "wav", true
+	case "audio/mpeg", "audio/mp3":
+		return "mp3", true
+	}
+	return "", false
 }
 
 func uriPath(uri string) string {

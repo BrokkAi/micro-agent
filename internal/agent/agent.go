@@ -99,7 +99,7 @@ func (a *Agent) Initialize(_ context.Context, request schema.InitializeRequest) 
 		AgentCapabilities: &schema.AgentCapabilities{
 			LoadSession:        ptr(true),
 			MCPCapabilities:    &schema.McpCapabilities{HTTP: ptr(true), SSE: ptr(true), ACP: ptr(true)},
-			PromptCapabilities: &schema.PromptCapabilities{Image: ptr(true), EmbeddedContext: ptr(true), Audio: ptr(false)},
+			PromptCapabilities: &schema.PromptCapabilities{Image: ptr(true), EmbeddedContext: ptr(true), Audio: ptr(true)},
 			SessionCapabilities: &schema.SessionCapabilities{
 				AdditionalDirectories: &schema.SessionAdditionalDirectoriesCapabilities{},
 				Close:                 &schema.SessionCloseCapabilities{},
