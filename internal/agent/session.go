@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -194,6 +195,49 @@ func (a *Agent) ResumeSession(ctx context.Context, request schema.ResumeSessionR
 	}
 	a.announce(s, notices, updater{a: a, id: s.ID})
 	return schema.ResumeSessionResponse{Modes: modeState(s.Mode), ConfigOptions: a.configOptions(s)}, nil
+}
+
+// ForkSession branches a saved or open session into a new one that starts
+// with a copy of its conversation, leaving the source untouched. Like the
+// session/new response, the fork's history is not replayed; session/load does
+// that.
+func (a *Agent) ForkSession(ctx context.Context, request schema.ForkSessionRequest) (schema.ForkSessionResponse, error) {
+	if err := checkRoots(request.Cwd, request.AdditionalDirectories); err != nil {
+		return schema.ForkSessionResponse{}, err
+	}
+	source, err := a.sourceRecord(request.SessionID)
+	if err != nil {
+		return schema.ForkSessionResponse{}, err
+	}
+	source.ID = newSessionID()
+	source.Cwd, source.Dirs = request.Cwd, request.AdditionalDirectories
+	source.Messages = slices.Clone(source.Messages)
+	source.Mode = validMode(source.Mode)
+	s := &session{record: source}
+	notices := a.open(ctx, s, request.MCPServers)
+	if err := a.save(s); err != nil {
+		return schema.ForkSessionResponse{}, err
+	}
+	a.announce(s, notices, updater{a: a, id: s.ID, queued: true})
+	return schema.ForkSessionResponse{
+		SessionID:     s.ID,
+		Modes:         modeState(s.Mode),
+		ConfigOptions: a.configOptions(s),
+	}, nil
+}
+
+// sourceRecord returns the live record of id, falling back to the record on
+// disk so a session from an earlier run still forks.
+func (a *Agent) sourceRecord(id schema.SessionId) (record, error) {
+	a.mu.Lock()
+	s := a.sessions[id]
+	a.mu.Unlock()
+	if s == nil {
+		return a.loadRecord(id)
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.record, nil
 }
 
 func (a *Agent) restore(ctx context.Context, id schema.SessionId, cwd string, dirs []string, servers []schema.McpServer) (*session, []schema.SessionUpdate, error) {

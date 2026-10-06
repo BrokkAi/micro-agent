@@ -462,6 +462,8 @@ func TestSessionRootsMustBeAbsolute(t *testing.T) {
 		"load dir":   {schema.SessionLoadMethodName, schema.LoadSessionRequest{SessionID: id, Cwd: h.dir, AdditionalDirectories: []string{"rel"}, MCPServers: none}},
 		"resume cwd": {schema.SessionResumeMethodName, schema.ResumeSessionRequest{SessionID: id, MCPServers: none}},
 		"resume dir": {schema.SessionResumeMethodName, schema.ResumeSessionRequest{SessionID: id, Cwd: h.dir, AdditionalDirectories: []string{"rel"}, MCPServers: none}},
+		"fork cwd":   {schema.SessionForkMethodName, schema.ForkSessionRequest{SessionID: id, MCPServers: none}},
+		"fork dir":   {schema.SessionForkMethodName, schema.ForkSessionRequest{SessionID: id, Cwd: h.dir, AdditionalDirectories: []string{"rel"}, MCPServers: none}},
 	}
 	for name, r := range requests {
 		if _, err := send[json.RawMessage](h, r.method, r.params); rpcCode(err) != -32602 {
@@ -488,6 +490,49 @@ func TestSessionRootsMustBeAbsolute(t *testing.T) {
 	load := schema.LoadSessionRequest{SessionID: id, Cwd: h.dir, MCPServers: none}
 	if _, err := send[schema.LoadSessionResponse](h, schema.SessionLoadMethodName, load); err != nil || len(dirs()) != 0 {
 		t.Fatalf("load without directories: %v, dirs %v", err, dirs())
+	}
+}
+
+func TestForkCopiesHistoryAndLeavesSource(t *testing.T) {
+	h := newHarness(t, schema.ClientCapabilities{})
+	h.router.responses = [][]string{textChunks("first answer")}
+	source := h.newSession()
+	h.prompt(source, "first question")
+
+	h.mu.Lock()
+	h.updates = nil
+	h.mu.Unlock()
+	fork, err := send[schema.ForkSessionResponse](h, schema.SessionForkMethodName, schema.ForkSessionRequest{
+		SessionID: source, Cwd: h.dir, MCPServers: []schema.McpServer{},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fork.SessionID == source || fork.Modes == nil || len(fork.ConfigOptions) == 0 {
+		t.Fatalf("fork = %+v", fork)
+	}
+	// A later call pushes the frame order, so the queued updates are in.
+	if _, err := send[schema.ListSessionsResponse](h, schema.SessionListMethodName, schema.ListSessionsRequest{}); err != nil {
+		t.Fatal(err)
+	}
+	if kinds := h.kinds(); slices.Contains(kinds, schema.SessionUpdateKindUserMessageChunk) || slices.Contains(kinds, schema.SessionUpdateKindAgentMessageChunk) {
+		t.Fatalf("fork replayed history: %v", kinds)
+	}
+
+	h.router.responses = [][]string{textChunks("forked answer")}
+	if reason := h.prompt(fork.SessionID, "second question").StopReason; reason != schema.StopReasonEndTurn {
+		t.Fatalf("stop reason %s", reason)
+	}
+	forked := fmt.Sprint(h.router.requests[1]["messages"])
+	if !strings.Contains(forked, "first question") || !strings.Contains(forked, "first answer") {
+		t.Fatalf("fork history = %v", forked)
+	}
+
+	h.router.responses = [][]string{textChunks("source answer")}
+	h.prompt(source, "third question")
+	sourceMessages := fmt.Sprint(h.router.requests[2]["messages"])
+	if strings.Contains(sourceMessages, "second question") || strings.Contains(sourceMessages, "forked answer") {
+		t.Fatalf("source saw fork messages: %v", sourceMessages)
 	}
 }
 

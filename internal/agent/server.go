@@ -145,6 +145,8 @@ func (a *Agent) dispatch(ctx context.Context, method string, raw json.RawMessage
 		return handle(ctx, raw, a.LoadSession)
 	case schema.SessionResumeMethodName:
 		return handle(ctx, raw, a.ResumeSession)
+	case schema.SessionForkMethodName:
+		return handle(ctx, raw, a.ForkSession)
 	case schema.SessionCloseMethodName:
 		return handle(ctx, raw, a.CloseSession)
 	case schema.SessionListMethodName:

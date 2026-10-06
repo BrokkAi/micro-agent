@@ -91,15 +91,18 @@ func TestMethodGating(t *testing.T) {
 	if h.init, err = h.initialize(schema.InitializeRequest{ProtocolVersion: 1}); err != nil {
 		t.Fatal(err)
 	}
-	if h.init.AgentCapabilities.SessionCapabilities.Fork != nil || h.init.AgentCapabilities.Providers != nil {
-		t.Fatal("fork or providers advertised")
+	if h.init.AgentCapabilities.SessionCapabilities.Fork == nil {
+		t.Fatal("fork not advertised")
 	}
-	fork := schema.ForkSessionRequest{SessionID: "abc", Cwd: h.dir, MCPServers: []schema.McpServer{}}
-	if _, err := send[json.RawMessage](h, schema.SessionForkMethodName, fork); rpcCode(err) != -32601 {
-		t.Errorf("session/fork: %v", err)
+	if h.init.AgentCapabilities.Providers != nil {
+		t.Fatal("providers advertised")
 	}
 	if _, err := send[json.RawMessage](h, schema.ProvidersListMethodName, schema.ListProvidersRequest{}); rpcCode(err) != -32601 {
 		t.Errorf("providers/list: %v", err)
+	}
+	fork := schema.ForkSessionRequest{SessionID: "abc", Cwd: h.dir, MCPServers: []schema.McpServer{}}
+	if _, err := send[json.RawMessage](h, schema.SessionForkMethodName, fork); rpcCode(err) != int(schema.ErrorCodeResourceNotFound) {
+		t.Errorf("session/fork of an unknown session: %v", err)
 	}
 	if _, err := send[json.RawMessage](h, schema.SessionPromptMethodName, map[string]any{"sessionId": 5}); rpcCode(err) != -32602 {
 		t.Errorf("bad params: %v", err)

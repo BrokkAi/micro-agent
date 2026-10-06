@@ -68,6 +68,7 @@ func (a *Agent) Initialize(_ context.Context, request schema.InitializeRequest) 
 				AdditionalDirectories: &schema.SessionAdditionalDirectoriesCapabilities{},
 				Close:                 &schema.SessionCloseCapabilities{},
 				Delete:                &schema.SessionDeleteCapabilities{},
+				Fork:                  &schema.SessionForkCapabilities{},
 				List:                  &schema.SessionListCapabilities{},
 				Resume:                &schema.SessionResumeCapabilities{},
 			},
