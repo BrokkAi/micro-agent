@@ -23,9 +23,9 @@ func Serve(ctx context.Context, a *Agent, in io.ReadCloser, out io.WriteCloser) 
 	// The first frame chooses the protocol version: a draft-v2 initialize is
 	// served as v2, everything else as v1 with the frame replayed.
 	reader := bufio.NewReaderSize(in, 64<<10)
-	line, err := reader.ReadBytes('\n')
-	if err != nil && len(line) == 0 {
-		if errors.Is(err, io.EOF) {
+	line, err := readFramePrefix(reader)
+	if err != nil {
+		if errors.Is(err, io.EOF) && len(line) == 0 {
 			return nil
 		}
 		return err
@@ -34,6 +34,28 @@ func Serve(ctx context.Context, a *Agent, in io.ReadCloser, out io.WriteCloser) 
 		return agent2.New(NewV2(a)).Serve(ctx, &prefixReader{prefix: rewritten, rest: reader, in: in}, out)
 	}
 	return a.serveV1(ctx, &prefixReader{prefix: line, rest: reader, in: in}, out)
+}
+
+// readFramePrefix reads the first frame, bounded at the frame limit rather
+// than buffering an arbitrarily long line; the rest of a longer frame streams
+// through the reader that follows.
+func readFramePrefix(reader *bufio.Reader) ([]byte, error) {
+	var line []byte
+	for len(line) < maxFrame {
+		chunk, err := reader.ReadSlice('\n')
+		line = append(line, chunk...)
+		switch {
+		case err == bufio.ErrBufferFull:
+			continue
+		case err != nil:
+			if len(line) == 0 {
+				return nil, err
+			}
+			return line, nil
+		}
+		return line, nil
+	}
+	return line, nil
 }
 
 // serveV1 runs the version 1 server, whose reader starts with one frame
