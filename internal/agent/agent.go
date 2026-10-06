@@ -37,6 +37,13 @@ type Agent struct {
 	// provider is the LLM routing a client set with providers/set. It is
 	// process-scoped: nothing here is written to the config file.
 	provider providerConfig
+
+	// stateMu guards the editor state NES works from.
+	stateMu  sync.Mutex
+	docs     map[string]document
+	focus    string
+	nes      map[schema.SessionId]*nesSession
+	encoding schema.PositionEncodingKind
 }
 
 // providerID names the one LLM provider micro-agent offers. Any
@@ -54,7 +61,14 @@ type providerConfig struct {
 
 // New returns an agent backed by the given configuration.
 func New(cfg *config.Store, version string) *Agent {
-	return &Agent{cfg: cfg, version: version, sessions: map[schema.SessionId]*session{}}
+	return &Agent{
+		cfg:      cfg,
+		version:  version,
+		sessions: map[schema.SessionId]*session{},
+		docs:     map[string]document{},
+		nes:      map[schema.SessionId]*nesSession{},
+		encoding: schema.PositionEncodingKindUtf16,
+	}
 }
 
 func (a *Agent) Initialize(_ context.Context, request schema.InitializeRequest) (schema.InitializeResponse, error) {
@@ -62,6 +76,10 @@ func (a *Agent) Initialize(_ context.Context, request schema.InitializeRequest) 
 	if request.ClientCapabilities != nil {
 		caps = *request.ClientCapabilities
 	}
+	encoding := choosePositionEncoding(caps.PositionEncodings)
+	a.stateMu.Lock()
+	a.encoding = encoding
+	a.stateMu.Unlock()
 	methods := []schema.AuthMethod{{Agent: &schema.AuthMethodAgent{
 		ID:          authMethodID,
 		Name:        "OpenRouter API key",
@@ -90,8 +108,10 @@ func (a *Agent) Initialize(_ context.Context, request schema.InitializeRequest) 
 				List:                  &schema.SessionListCapabilities{},
 				Resume:                &schema.SessionResumeCapabilities{},
 			},
-			Auth:      &schema.AgentAuthCapabilities{Logout: &schema.LogoutCapabilities{}},
-			Providers: &schema.ProvidersCapabilities{},
+			Auth:             &schema.AgentAuthCapabilities{Logout: &schema.LogoutCapabilities{}},
+			Providers:        &schema.ProvidersCapabilities{},
+			Nes:              nesCapabilities(),
+			PositionEncoding: &encoding,
 		},
 	}
 	a.mu.Lock()
@@ -248,6 +268,11 @@ func (a *Agent) DisableProvider(_ context.Context, request schema.DisableProvide
 	a.provider.disabled = true
 	a.mu.Unlock()
 	return schema.DisableProviderResponse{}, nil
+}
+
+// providerDisabledError reports that the client turned LLM calls off.
+func providerDisabledError() error {
+	return &acp.RPCError{Code: int(schema.ErrorCodeInvalidRequest), Message: "provider " + providerID + " is disabled; configure it with providers/set first"}
 }
 
 // providerBaseURL validates a base URL from providers/set.

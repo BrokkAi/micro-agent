@@ -27,7 +27,7 @@ func Serve(ctx context.Context, a *Agent, in io.ReadCloser, out io.WriteCloser) 
 		return notifications(method, raw)
 	})
 	a.client = &clientConn{a: a, conn: conn, out: w, messages: acpmcp.NewMessageClient(conn)}
-	notifications = a.client.messages.Notifications(a.notification)
+	notifications = a.client.messages.Notifications(unstable.HandleNesNotifications(a.notification, a))
 	close(ready) // the reader holds frames back until here
 	defer conn.Close()
 
@@ -131,6 +131,8 @@ func offers(caps *schema.AgentCapabilities, method string) bool {
 		return caps.Auth != nil && caps.Auth.Logout != nil
 	case schema.ProvidersListMethodName, schema.ProvidersSetMethodName, schema.ProvidersDisableMethodName:
 		return caps.Providers != nil
+	case schema.NesStartMethodName, schema.NesSuggestMethodName, schema.NesCloseMethodName:
+		return caps.Nes != nil
 	}
 	return true
 }
@@ -185,9 +187,34 @@ func handle[Req, Resp any](ctx context.Context, raw json.RawMessage, run func(co
 // Malformed notifications are ignored: returning an error would close the
 // connection.
 func (a *Agent) notification(method string, raw json.RawMessage) error {
-	var cancel schema.CancelNotification
-	if method == schema.SessionCancelMethodName && json.Unmarshal(raw, &cancel) == nil {
-		return a.CancelSession(context.Background(), cancel)
+	switch method {
+	case schema.SessionCancelMethodName:
+		var cancel schema.CancelNotification
+		if json.Unmarshal(raw, &cancel) == nil {
+			return a.CancelSession(context.Background(), cancel)
+		}
+	case schema.DocumentDidopenMethodName:
+		var opened schema.DidOpenDocumentNotification
+		if json.Unmarshal(raw, &opened) == nil {
+			a.didOpenDocument(opened)
+		}
+	case schema.DocumentDidchangeMethodName:
+		var changed schema.DidChangeDocumentNotification
+		if json.Unmarshal(raw, &changed) == nil {
+			a.didChangeDocument(changed)
+		}
+	case schema.DocumentDidcloseMethodName:
+		var closed schema.DidCloseDocumentNotification
+		if json.Unmarshal(raw, &closed) == nil {
+			a.didCloseDocument(closed)
+		}
+	case schema.DocumentDidfocusMethodName:
+		var focused schema.DidFocusDocumentNotification
+		if json.Unmarshal(raw, &focused) == nil {
+			a.didFocusDocument(focused)
+		}
+	case schema.DocumentDidsaveMethodName:
+		a.didSaveDocument()
 	}
 	return nil
 }

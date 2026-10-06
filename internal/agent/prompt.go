@@ -38,7 +38,7 @@ func (a *Agent) Prompt(parent context.Context, request schema.PromptRequest) (sc
 		return t.command(ctx, name, args)
 	}
 	if _, _, _, _, disabled := a.providerSettings(); disabled {
-		return schema.PromptResponse{}, &acp.RPCError{Code: int(schema.ErrorCodeInvalidRequest), Message: "provider " + providerID + " is disabled; configure it with providers/set first"}
+		return schema.PromptResponse{}, providerDisabledError()
 	}
 	if !a.credentialed() {
 		if !t.login(ctx, "") {
