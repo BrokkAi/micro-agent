@@ -112,6 +112,26 @@ var builtinTools = []openrouter.Tool{
 		},
 		"required": ["path", "content"]
 	}`),
+	function("update_plan", "Replace the plan shown to the user. Send the complete task list with the current status of every entry; mark one entry in_progress at a time. Add markdown for a longer plan document when useful, or clear to remove the plan.", `{
+		"type": "object",
+		"properties": {
+			"entries": {
+				"type": "array",
+				"description": "The complete task list, replacing the current one. Omit to keep it.",
+				"items": {
+					"type": "object",
+					"properties": {
+						"content": {"type": "string", "description": "What the task is."},
+						"status": {"type": "string", "enum": ["pending", "in_progress", "completed"]},
+						"priority": {"type": "string", "enum": ["high", "medium", "low"]}
+					},
+					"required": ["content", "status", "priority"]
+				}
+			},
+			"markdown": {"type": "string", "description": "Optional markdown plan document that replaces the current one."},
+			"clear": {"type": "boolean", "description": "Remove the plan before applying entries or markdown."}
+		}
+	}`),
 }
 
 func function(name, description, parameters string) openrouter.Tool {
@@ -189,6 +209,12 @@ type writeArgs struct {
 	Content string `json:"content"`
 }
 
+type planArgs struct {
+	Entries  []schema.PlanEntry `json:"entries"`
+	Markdown string             `json:"markdown"`
+	Clear    bool               `json:"clear"`
+}
+
 // describeCall produces a title and kind without side effects; used for
 // replaying history.
 func describeCall(name string, raw json.RawMessage) (string, schema.ToolKind) {
@@ -206,6 +232,8 @@ func describeCall(name string, raw json.RawMessage) (string, schema.ToolKind) {
 		return "Edit " + args.Path, schema.ToolKindEdit
 	case "write_file":
 		return "Write " + args.Path, schema.ToolKindEdit
+	case "update_plan":
+		return "Update plan", schema.ToolKindOther
 	}
 	return name, schema.ToolKindOther
 }
@@ -292,6 +320,35 @@ func (t *turn) prepare(ctx context.Context, name string, raw json.RawMessage) (*
 			old = &text
 		}
 		return t.writeAction("Write "+t.display(path), path, 1, old, args.Content), nil
+	case "update_plan":
+		var args planArgs
+		if r := decode(&args); r != nil {
+			return nil, r
+		}
+		for i := range args.Entries {
+			entry := &args.Entries[i]
+			switch entry.Status {
+			case schema.PlanEntryStatusPending, schema.PlanEntryStatusInProgress, schema.PlanEntryStatusCompleted:
+			default:
+				r := failure("entry %d has unknown status %q", i+1, entry.Status)
+				return nil, &r
+			}
+			switch entry.Priority {
+			case schema.PlanEntryPriorityHigh, schema.PlanEntryPriorityMedium, schema.PlanEntryPriorityLow:
+			default:
+				r := failure("entry %d has unknown priority %q", i+1, entry.Priority)
+				return nil, &r
+			}
+			if strings.TrimSpace(entry.Content) == "" {
+				r := failure("entry %d has no content", i+1)
+				return nil, &r
+			}
+		}
+		return &action{
+			title: "Update plan",
+			kind:  schema.ToolKindOther,
+			run:   func(context.Context) toolResult { return t.updatePlan(args) },
+		}, nil
 	}
 	if binding, ok := t.mcp[name]; ok {
 		return t.mcpAction(binding, raw), nil
@@ -332,6 +389,31 @@ func (t *turn) writeAction(title, path string, line uint32, old *string, updated
 			return toolResult{output: fmt.Sprintf("%s %s", verb, path), content: []schema.ToolCallContent{diff}}
 		},
 	}
+}
+
+// updatePlan stores the new plan and publishes it to the client.
+func (t *turn) updatePlan(args planArgs) toolResult {
+	t.s.mu.Lock()
+	if args.Clear {
+		t.s.Plan, t.s.PlanMarkdown = nil, ""
+	}
+	if args.Entries != nil {
+		t.s.Plan = args.Entries
+	}
+	if strings.TrimSpace(args.Markdown) != "" {
+		t.s.PlanMarkdown = args.Markdown
+	}
+	entries, markdown := t.s.Plan, t.s.PlanMarkdown
+	t.s.mu.Unlock()
+	removed := args.Clear && entries == nil && markdown == ""
+	for _, update := range t.a.planUpdates(entries, markdown, removed) {
+		_ = t.updates.Update(update)
+	}
+	_ = t.a.save(t.s)
+	if removed {
+		return toolResult{output: "Plan cleared."}
+	}
+	return toolResult{output: fmt.Sprintf("Plan updated: %d entries.", len(entries))}
 }
 
 // applyEdit returns text with the edit made, and the line of the first match.

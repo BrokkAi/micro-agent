@@ -155,6 +155,10 @@ func (a *Agent) canNotices() bool {
 	return a.capable(func(c schema.ClientCapabilities) bool { return c.Session != nil && c.Session.Notices != nil })
 }
 
+func (a *Agent) canPlan() bool {
+	return a.capable(func(c schema.ClientCapabilities) bool { return c.Plan != nil })
+}
+
 // notice builds one user-facing advisory update: a live notice when the
 // client advertises notices, an agent message chunk otherwise.
 func (a *Agent) notice(severity schema.NoticeSeverity, title, description string) schema.SessionUpdate {

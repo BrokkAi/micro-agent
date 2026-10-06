@@ -191,8 +191,15 @@ func (t *turn) command(ctx context.Context, name, args string) (schema.PromptRes
 		t.s.mu.Lock()
 		t.s.Messages = nil
 		t.s.Cost = 0
+		hadPlan := t.s.Plan != nil || t.s.PlanMarkdown != ""
+		t.s.Plan, t.s.PlanMarkdown = nil, ""
 		t.s.mu.Unlock()
 		_ = t.a.save(t.s)
+		if hadPlan {
+			for _, update := range t.a.planUpdates(nil, "", true) {
+				_ = t.updates.Update(update)
+			}
+		}
 		t.say("Conversation cleared.")
 	}
 	return done, nil

@@ -33,6 +33,9 @@ type record struct {
 	Effort    string               `json:"effort,omitempty"`
 	Cost      float64              `json:"cost,omitempty"`
 	Messages  []openrouter.Message `json:"messages"`
+	Plan      []schema.PlanEntry   `json:"plan,omitempty"`
+	// PlanMarkdown is the richer plan document shown beside the entries.
+	PlanMarkdown string `json:"plan_markdown,omitempty"`
 }
 
 type session struct {
@@ -244,6 +247,38 @@ func (a *Agent) sourceRecord(id schema.SessionId) (record, error) {
 	return s.record, nil
 }
 
+// planID names the one plan a session keeps.
+const planID = schema.PlanId("plan")
+
+// planUpdates renders a session's plan as session updates. The task list goes
+// out as the stable plan update; the id-addressed plan_update and
+// plan_removed shapes the client gates with its plan capability follow, so a
+// client that folds either surface sees the same state.
+func (a *Agent) planUpdates(entries []schema.PlanEntry, markdown string, removed bool) []schema.SessionUpdate {
+	if removed {
+		updates := []schema.SessionUpdate{{Plan: &schema.Plan{Entries: []schema.PlanEntry{}}}}
+		if a.canPlan() {
+			updates = append(updates, schema.SessionUpdate{PlanRemoved: &schema.PlanRemoved{PlanID: planID}})
+		}
+		return updates
+	}
+	var updates []schema.SessionUpdate
+	if entries != nil {
+		updates = append(updates, schema.SessionUpdate{Plan: &schema.Plan{Entries: entries}})
+		if a.canPlan() {
+			updates = append(updates, schema.SessionUpdate{PlanUpdate: &schema.PlanUpdate{Plan: schema.PlanUpdateContent{
+				Items: &schema.PlanItems{PlanID: planID, Entries: entries},
+			}}})
+		}
+	}
+	if markdown != "" && a.canPlan() {
+		updates = append(updates, schema.SessionUpdate{PlanUpdate: &schema.PlanUpdate{Plan: schema.PlanUpdateContent{
+			Markdown: &schema.PlanMarkdown{PlanID: planID, Content: markdown},
+		}}})
+	}
+	return updates
+}
+
 func (a *Agent) restore(ctx context.Context, id schema.SessionId, cwd string, dirs []string, servers []schema.McpServer) (*session, []schema.SessionUpdate, error) {
 	if err := checkRoots(cwd, dirs); err != nil {
 		return nil, nil, err
@@ -356,6 +391,11 @@ func (a *Agent) ListSessions(_ context.Context, request schema.ListSessionsReque
 // replay streams a restored conversation back to the client as session updates.
 func (a *Agent) replay(ctx context.Context, s *session) {
 	send := func(update schema.SessionUpdate) { _ = a.notify(ctx, s.ID, update) }
+	if s.Plan != nil || s.PlanMarkdown != "" {
+		for _, update := range a.planUpdates(s.Plan, s.PlanMarkdown, false) {
+			send(update)
+		}
+	}
 	results := map[string]openrouter.Message{}
 	for _, m := range s.Messages {
 		if m.Role == "tool" {
